@@ -2,6 +2,8 @@ import os
 import subprocess
 import tempfile
 import requests
+from PIL import Image
+from io import BytesIO
 from flask import Flask, request, send_file, jsonify
 
 app = Flask(__name__)
@@ -32,15 +34,29 @@ def render_reel():
 
     with tempfile.TemporaryDirectory() as tmp:
 
-        # ── Download frames ──────────────────────────────────
+        # ── Download frames (resize to target dims to save RAM) ──
         frame_paths = []
         for i, url in enumerate(images):
             resp = requests.get(url, timeout=30, allow_redirects=True)
             if resp.status_code != 200:
                 return jsonify(error=f"Failed to download image {i+1}: HTTP {resp.status_code}"), 502
+            # Resize to target dimensions with Pillow before handing to FFmpeg
+            img = Image.open(BytesIO(resp.content)).convert("RGB")
+            # Cover-scale: fill canvas without black bars
+            src_ratio  = img.width / img.height
+            tgt_ratio  = width / height
+            if src_ratio > tgt_ratio:
+                new_h = height
+                new_w = int(img.width * height / img.height)
+            else:
+                new_w = width
+                new_h = int(img.height * width / img.width)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            left = (new_w - width)  // 2
+            top  = (new_h - height) // 2
+            img  = img.crop((left, top, left + width, top + height))
             path = os.path.join(tmp, f"frame_{i:03d}.png")
-            with open(path, "wb") as f:
-                f.write(resp.content)
+            img.save(path, "PNG")
             frame_paths.append(path)
 
         output = os.path.join(tmp, "reel.mp4")
@@ -60,12 +76,8 @@ def render_reel():
 
 
 def _scale_filter(width, height):
-    """Cover-scale to exactly width×height (no black bars)."""
-    return (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},"
-        f"setsar=1,fps=30"
-    )
+    # Images are already cover-cropped by Pillow; just set SAR and fps
+    return f"setsar=1,fps=30"
 
 
 def _ffmpeg_single(path, duration, width, height, output):
