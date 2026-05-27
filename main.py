@@ -34,11 +34,35 @@ def render_reel():
     with tempfile.TemporaryDirectory() as tmp:
 
         # ── 1. Download + cover-crop each image to target size ────
+        # Google Drive "export=view" URLs redirect through a consent page;
+        # rewrite them to "export=download" for a direct binary response.
+        def _normalise_url(u):
+            if "drive.google.com/uc" in u:
+                return u.replace("export=view", "export=download")
+            # drive.google.com/file/d/<ID>/view → direct download
+            import re
+            m = re.search(r"/file/d/([^/]+)", u)
+            if m:
+                return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+            return u
+
+        _headers = {"User-Agent": "Mozilla/5.0"}
+
         frame_paths = []
         for i, url in enumerate(images):
-            resp = requests.get(url, timeout=30, allow_redirects=True)
+            dl_url = _normalise_url(url)
+            resp = requests.get(dl_url, timeout=30, allow_redirects=True, headers=_headers)
             if resp.status_code != 200:
-                return jsonify(error=f"Image {i+1} download failed: HTTP {resp.status_code}"), 502
+                return jsonify(error=f"Image {i+1} download failed: HTTP {resp.status_code} url={dl_url}"), 502
+
+            # Google sometimes returns an HTML virus-scan warning for large files;
+            # detect it and follow the confirm link.
+            if resp.headers.get("Content-Type", "").startswith("text/html"):
+                import re as _re
+                m = _re.search(r'href="(/uc\?[^"]*confirm=[^"]+)"', resp.text)
+                if m:
+                    confirm_url = "https://drive.google.com" + m.group(1).replace("&amp;", "&")
+                    resp = requests.get(confirm_url, timeout=30, allow_redirects=True, headers=_headers)
 
             img = Image.open(BytesIO(resp.content)).convert("RGB")
             src_ratio = img.width / img.height
