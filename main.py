@@ -1,12 +1,19 @@
 import os
+import base64
 import subprocess
 import tempfile
+import traceback
 import requests
 from PIL import Image
 from io import BytesIO
 from flask import Flask, request, send_file, jsonify
 
 app = Flask(__name__)
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    return jsonify(error=str(e), traceback=traceback.format_exc()[-2000:]), 500
 
 
 @app.route("/health")
@@ -38,8 +45,7 @@ def render_reel():
         for i, url in enumerate(images):
             if url.startswith("data:"):
                 # Base64 data URI — decode directly, no HTTP needed
-                header, b64data = url.split(",", 1)
-                import base64
+                _, b64data = url.split(",", 1)
                 raw = base64.b64decode(b64data)
             else:
                 resp = requests.get(url, timeout=30, allow_redirects=True,
