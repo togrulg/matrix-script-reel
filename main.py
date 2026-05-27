@@ -42,16 +42,21 @@ def render_reel():
 
         # ── 1. Decode / download each image ──────────────────────
         frame_paths = []
+        _sess = requests.Session()
+        _sess.headers.update({"User-Agent": "Mozilla/5.0"})
+
         for i, url in enumerate(images):
             if url.startswith("data:"):
-                # Base64 data URI — decode directly, no HTTP needed
                 _, b64data = url.split(",", 1)
                 raw = base64.b64decode(b64data)
             else:
-                resp = requests.get(url, timeout=30, allow_redirects=True,
-                                    headers={"User-Agent": "Mozilla/5.0"})
+                resp = _sess.get(url, timeout=60, allow_redirects=True)
                 if resp.status_code != 200:
-                    return jsonify(error=f"Image {i+1} download failed: HTTP {resp.status_code}"), 502
+                    return jsonify(error=f"Image {i+1} download failed: HTTP {resp.status_code} from {url[:120]}"), 502
+                # If Google returned an HTML page (virus-scan / login redirect), bail clearly
+                ct = resp.headers.get("Content-Type", "")
+                if "text/html" in ct:
+                    return jsonify(error=f"Image {i+1}: got HTML instead of image from {url[:120]}"), 502
                 raw = resp.content
 
             img = Image.open(BytesIO(raw)).convert("RGB")
