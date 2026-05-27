@@ -11,4 +11,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 ENV PORT=8080
-CMD ["python", "main.py"]
+# Shell form so $PORT is expanded; 120s timeout covers FFmpeg stitching
+CMD gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 1 main:app
