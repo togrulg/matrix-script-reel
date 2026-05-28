@@ -3,6 +3,8 @@ import base64
 import subprocess
 import tempfile
 import traceback
+import time
+from collections import deque
 import requests
 from PIL import Image
 from io import BytesIO
@@ -10,10 +12,20 @@ from flask import Flask, request, send_file, jsonify
 
 app = Flask(__name__)
 
+# ── In-process request log (last 20 entries) ─────────────────
+_LOG = deque(maxlen=20)
+
+def _log(msg):
+    entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    _LOG.append(entry)
+    print(entry, flush=True)
+
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    return jsonify(error=str(e), traceback=traceback.format_exc()[-2000:]), 500
+    tb = traceback.format_exc()
+    _log(f"UNHANDLED: {e}\n{tb[-1000:]}")
+    return jsonify(error=str(e), traceback=tb[-3000:]), 500
 
 
 @app.route("/health")
@@ -21,12 +33,20 @@ def health():
     return "ok"
 
 
+@app.route("/logs")
+def logs():
+    """Returns the last 20 request log lines — useful for debugging 500s."""
+    return jsonify(logs=list(_LOG))
+
+
 @app.route("/render-reel", methods=["POST"])
 def render_reel():
     try:
         return _render_reel_impl()
     except Exception as e:
-        return jsonify(error=str(e), traceback=traceback.format_exc()[-3000:]), 500
+        tb = traceback.format_exc()
+        _log(f"ERROR in render_reel: {e}\n{tb[-500:]}")
+        return jsonify(error=str(e), traceback=tb[-3000:]), 500
 
 
 def _render_reel_impl():
@@ -35,9 +55,11 @@ def _render_reel_impl():
     images     = data.get("images", [])
     durations  = data.get("durations", [])
     fade_dur   = float(data.get("fade_dur", 0.5))
-    transition = data.get("transition", "fade").lower()   # cut | fade | xfade
+    transition = data.get("transition", "fade").lower()
     width      = int(data.get("width", 720))
     height     = int(data.get("height", 1280))
+
+    _log(f"START render_reel: {len(images)} images, transition={transition}, {width}x{height}")
 
     if not images:
         return jsonify(error="images list is empty"), 400
@@ -53,18 +75,24 @@ def _render_reel_impl():
         _sess.headers.update({"User-Agent": "Mozilla/5.0"})
 
         for i, url in enumerate(images):
+            _log(f"  Frame {i+1}/{len(images)}: {'data URI' if url.startswith('data:') else url[:80]}")
             if url.startswith("data:"):
                 _, b64data = url.split(",", 1)
                 raw = base64.b64decode(b64data)
             else:
                 resp = _sess.get(url, timeout=60, allow_redirects=True)
                 if resp.status_code != 200:
-                    return jsonify(error=f"Image {i+1} download failed: HTTP {resp.status_code} from {url[:120]}"), 502
+                    msg = f"Image {i+1} download failed: HTTP {resp.status_code} from {url[:120]}"
+                    _log(f"  ERROR: {msg}")
+                    return jsonify(error=msg), 502
                 ct = resp.headers.get("Content-Type", "")
                 if "text/html" in ct:
-                    return jsonify(error=f"Image {i+1}: got HTML instead of image from {url[:120]}"), 502
+                    msg = f"Image {i+1}: got HTML instead of image (URL expired or needs auth): {url[:120]}"
+                    _log(f"  ERROR: {msg}")
+                    return jsonify(error=msg), 502
                 raw = resp.content
 
+            _log(f"  Frame {i+1}: {len(raw)//1024}KB downloaded, opening with Pillow…")
             img = Image.open(BytesIO(raw)).convert("RGB")
             src_ratio = img.width / img.height
             tgt_ratio = width / height
@@ -82,11 +110,13 @@ def _render_reel_impl():
             img.save(path, "PNG")
             frame_paths.append(path)
             img.close()
+            _log(f"  Frame {i+1}: saved to {path}")
 
         # ── 2. Encode each frame to a clip ────────────────────────
         clip_paths = []
         for i, (frame, dur) in enumerate(zip(frame_paths, durations)):
             clip = os.path.join(tmp, f"clip_{i:03d}.mp4")
+            _log(f"  Encoding clip {i+1}/{len(frame_paths)} ({dur}s, transition={transition})…")
 
             if transition == "fade":
                 fade_in  = 0 if i == 0 else fade_dur
@@ -108,16 +138,20 @@ def _render_reel_impl():
                 "-pix_fmt", "yuv420p",
                 clip,
             ]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
+                _log(f"  FFmpeg clip {i+1} FAILED: {r.stderr[-300:]}")
                 return jsonify(error=f"FFmpeg clip {i+1} failed", stderr=r.stderr[-500:]), 500
             clip_paths.append(clip)
+            _log(f"  Clip {i+1} done")
 
         output = os.path.join(tmp, "reel.mp4")
 
         if transition == "xfade":
+            _log("  Concatenating with xfade…")
             r = _concat_xfade(clip_paths, durations, fade_dur, output)
         else:
+            _log("  Concatenating clips…")
             concat_list = os.path.join(tmp, "concat.txt")
             with open(concat_list, "w") as f:
                 for clip in clip_paths:
@@ -128,11 +162,14 @@ def _render_reel_impl():
                 "-c", "copy",
                 output,
             ]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
         if r.returncode != 0:
+            _log(f"  FFmpeg concat FAILED: {r.stderr[-300:]}")
             return jsonify(error="FFmpeg concat failed", stderr=r.stderr[-500:]), 500
 
+        size_kb = os.path.getsize(output) // 1024
+        _log(f"  SUCCESS: reel.mp4 {size_kb}KB — sending to client")
         return send_file(output, mimetype="video/mp4", as_attachment=True,
                          download_name="reel.mp4")
 
@@ -170,7 +207,7 @@ def _concat_xfade(clip_paths, durations, fade_dur, output):
            "-pix_fmt", "yuv420p",
            output]
     )
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
 
 if __name__ == "__main__":
