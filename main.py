@@ -133,9 +133,11 @@ def _render_reel_impl(job_id, data):
     images     = data.get("images", [])
     durations  = data.get("durations", [])
     fade_dur   = float(data.get("fade_dur", 0.5))
-    transition = data.get("transition", "fade").lower()
-    width      = int(data.get("width",  720))
-    height     = int(data.get("height", 1280))
+    # xfade loads ALL clips into memory simultaneously — OOM on 512MB free tier.
+    # Force 'fade' which processes clips one at a time then stream-copies.
+    transition = "fade"
+    width      = int(data.get("width",  540))   # 540x960 = 9:16, ~40% less memory than 720x1280
+    height     = int(data.get("height", 960))
 
     if not images:
         raise ValueError("No images provided")
