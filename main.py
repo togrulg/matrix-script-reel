@@ -132,17 +132,22 @@ def _render_reel_impl():
                 vf = "setsar=1,fps=24"
 
             cmd = [
-                "ffmpeg", "-y",
+                "ffmpeg", "-y", "-loglevel", "error",
                 "-loop", "1", "-t", str(dur), "-i", frame,
                 "-vf", vf,
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
                 "-pix_fmt", "yuv420p",
                 clip,
             ]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, timeout=120)
             if r.returncode != 0:
-                _log(f"  FFmpeg clip {i+1} FAILED: {r.stderr[-300:]}")
-                return jsonify(error=f"FFmpeg clip {i+1} failed", stderr=r.stderr[-500:]), 500
+                err = r.stderr.decode(errors="replace")[-300:]
+                _log(f"  FFmpeg clip {i+1} FAILED: {err}")
+                return jsonify(error=f"FFmpeg clip {i+1} failed", stderr=err), 500
+            # Free the source PNG immediately after encoding
+            try: os.remove(frame)
+            except: pass
             clip_paths.append(clip)
             _log(f"  Clip {i+1} done")
 
@@ -158,12 +163,14 @@ def _render_reel_impl():
                 for clip in clip_paths:
                     f.write(f"file '{clip}'\n")
             cmd = [
-                "ffmpeg", "-y",
+                "ffmpeg", "-y", "-loglevel", "error",
                 "-f", "concat", "-safe", "0", "-i", concat_list,
                 "-c", "copy",
                 output,
             ]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, timeout=120)
+            r.stderr = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else (r.stderr or "")
 
         if r.returncode != 0:
             _log(f"  FFmpeg concat FAILED: {r.stderr[-300:]}")
@@ -200,7 +207,7 @@ def _concat_xfade(clip_paths, durations, fade_dur, output):
         prev_label = out_label
 
     cmd = (
-        ["ffmpeg", "-y"]
+        ["ffmpeg", "-y", "-loglevel", "error"]
         + inputs
         + ["-filter_complex", ";".join(filters),
            "-map", "[vout]",
@@ -208,7 +215,10 @@ def _concat_xfade(clip_paths, durations, fade_dur, output):
            "-pix_fmt", "yuv420p",
            output]
     )
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, timeout=300)
+    r.stderr = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else (r.stderr or "")
+    return r
 
 
 if __name__ == "__main__":
