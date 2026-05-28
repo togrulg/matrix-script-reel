@@ -133,7 +133,8 @@ def _render_reel_impl(job_id, data):
     images       = data.get("images", [])
     durations    = data.get("durations", [])
     fade_dur     = float(data.get("fade_dur", 0.5))
-    music_data   = data.get("music")          # base64 data URI or None
+    music_data   = data.get("music")           # base64 data URI (legacy)
+    music_url    = data.get("music_url")       # direct download URL (Jamendo)
     music_volume = float(data.get("music_volume", 0.3))
     # xfade loads ALL clips into memory simultaneously — OOM on 512MB free tier.
     # Force 'fade' which processes clips one at a time then stream-copies.
@@ -230,16 +231,31 @@ def _render_reel_impl(job_id, data):
         raise RuntimeError(f"FFmpeg concat failed: {r.stderr[-500:]}")
 
     # ── 4. Mix in background music (optional) ─────────────────
-    if music_data:
+    has_music = music_data or music_url
+    if has_music:
         _log(f"  Mixing background music (volume={music_volume})…")
-        # Decode audio from base64 data URI
-        if "," in music_data:
-            _, b64audio = music_data.split(",", 1)
-        else:
-            b64audio = music_data
         audio_path = os.path.join(tmp, "music.mp3")
-        with open(audio_path, "wb") as f:
-            f.write(base64.b64decode(b64audio))
+
+        if music_url:
+            # Download directly from Jamendo (or any public URL)
+            _log(f"  Downloading music from: {music_url[:80]}")
+            resp = sess.get(music_url, timeout=60, allow_redirects=True)
+            if resp.status_code != 200:
+                _log(f"  Music download failed HTTP {resp.status_code} — skipping")
+                has_music = False
+            else:
+                with open(audio_path, "wb") as f:
+                    f.write(resp.content)
+        else:
+            # Legacy: base64 data URI
+            if "," in music_data:
+                _, b64audio = music_data.split(",", 1)
+            else:
+                b64audio = music_data
+            with open(audio_path, "wb") as f:
+                f.write(base64.b64decode(b64audio))
+
+    if has_music:
 
         mixed = os.path.join(tmp, "reel_music.mp4")
         cmd = [
