@@ -130,9 +130,11 @@ def _run_job(job_id, data):
 
 
 def _render_reel_impl(job_id, data):
-    images     = data.get("images", [])
-    durations  = data.get("durations", [])
-    fade_dur   = float(data.get("fade_dur", 0.5))
+    images       = data.get("images", [])
+    durations    = data.get("durations", [])
+    fade_dur     = float(data.get("fade_dur", 0.5))
+    music_data   = data.get("music")          # base64 data URI or None
+    music_volume = float(data.get("music_volume", 0.3))
     # xfade loads ALL clips into memory simultaneously — OOM on 512MB free tier.
     # Force 'fade' which processes clips one at a time then stream-copies.
     transition = "fade"
@@ -226,6 +228,37 @@ def _render_reel_impl(job_id, data):
 
     if r.returncode != 0:
         raise RuntimeError(f"FFmpeg concat failed: {r.stderr[-500:]}")
+
+    # ── 4. Mix in background music (optional) ─────────────────
+    if music_data:
+        _log(f"  Mixing background music (volume={music_volume})…")
+        # Decode audio from base64 data URI
+        if "," in music_data:
+            _, b64audio = music_data.split(",", 1)
+        else:
+            b64audio = music_data
+        audio_path = os.path.join(tmp, "music.mp3")
+        with open(audio_path, "wb") as f:
+            f.write(base64.b64decode(b64audio))
+
+        mixed = os.path.join(tmp, "reel_music.mp4")
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", output,                        # video (no audio)
+            "-i", audio_path,                    # music track
+            "-c:v", "copy",                      # don't re-encode video
+            "-c:a", "aac", "-b:a", "128k",       # encode audio as AAC
+            "-filter:a", f"volume={music_volume}",
+            "-shortest",                         # cut when video ends
+            mixed,
+        ]
+        r2 = subprocess.run(cmd, stderr=subprocess.PIPE, timeout=120)
+        if r2.returncode != 0:
+            err = r2.stderr.decode(errors="replace")[-300:]
+            _log(f"  Music mix failed (continuing without music): {err}")
+        else:
+            output = mixed
+            _log("  Music mixed successfully")
 
     return output
 
