@@ -23,6 +23,13 @@ def health():
 
 @app.route("/render-reel", methods=["POST"])
 def render_reel():
+    try:
+        return _render_reel_impl()
+    except Exception as e:
+        return jsonify(error=str(e), traceback=traceback.format_exc()[-3000:]), 500
+
+
+def _render_reel_impl():
     data = request.get_json(force=True)
 
     images     = data.get("images", [])
@@ -53,7 +60,6 @@ def render_reel():
                 resp = _sess.get(url, timeout=60, allow_redirects=True)
                 if resp.status_code != 200:
                     return jsonify(error=f"Image {i+1} download failed: HTTP {resp.status_code} from {url[:120]}"), 502
-                # If Google returned an HTML page (virus-scan / login redirect), bail clearly
                 ct = resp.headers.get("Content-Type", "")
                 if "text/html" in ct:
                     return jsonify(error=f"Image {i+1}: got HTML instead of image from {url[:120]}"), 502
@@ -83,8 +89,6 @@ def render_reel():
             clip = os.path.join(tmp, f"clip_{i:03d}.mp4")
 
             if transition == "fade":
-                # Fade to black at end; fade from black at start (except first/last clips
-                # get only one fade so the very beginning/end isn't double-faded).
                 fade_in  = 0 if i == 0 else fade_dur
                 fade_out = 0 if i == len(images) - 1 else fade_dur
                 vf_parts = ["setsar=1", "fps=24"]
@@ -94,7 +98,6 @@ def render_reel():
                     vf_parts.append(f"fade=t=out:st={dur - fade_out:.3f}:d={fade_out}")
                 vf = ",".join(vf_parts)
             else:
-                # cut or xfade both use plain clips; xfade is applied at concat time
                 vf = "setsar=1,fps=24"
 
             cmd = [
@@ -105,7 +108,7 @@ def render_reel():
                 "-pix_fmt", "yuv420p",
                 clip,
             ]
-            r = subprocess.run(cmd, capture_output=True, text=True)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
                 return jsonify(error=f"FFmpeg clip {i+1} failed", stderr=r.stderr[-500:]), 500
             clip_paths.append(clip)
@@ -113,10 +116,8 @@ def render_reel():
         output = os.path.join(tmp, "reel.mp4")
 
         if transition == "xfade":
-            # ── 3a. xfade: build a single filtergraph chaining all clips ──
             r = _concat_xfade(clip_paths, durations, fade_dur, output)
         else:
-            # ── 3b. cut / fade: simple concat demuxer ─────────────────────
             concat_list = os.path.join(tmp, "concat.txt")
             with open(concat_list, "w") as f:
                 for clip in clip_paths:
@@ -127,7 +128,7 @@ def render_reel():
                 "-c", "copy",
                 output,
             ]
-            r = subprocess.run(cmd, capture_output=True, text=True)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
         if r.returncode != 0:
             return jsonify(error="FFmpeg concat failed", stderr=r.stderr[-500:]), 500
@@ -137,23 +138,18 @@ def render_reel():
 
 
 def _concat_xfade(clip_paths, durations, fade_dur, output):
-    """Chains N clips with xfade=dissolve between each pair."""
     n = len(clip_paths)
     if n == 1:
-        # Nothing to dissolve — just copy the single clip
         import shutil
         shutil.copy(clip_paths[0], output)
         class _R:
-            returncode = 0
-            stderr = ""
+            returncode = 0; stderr = ""
         return _R()
 
-    # Build ffmpeg inputs + filtergraph
     inputs = []
     for p in clip_paths:
         inputs += ["-i", p]
 
-    # Each xfade offset = sum of preceding clip durations minus accumulated fade overlap
     filters = []
     offset = durations[0] - fade_dur
     prev_label = "[0:v]"
@@ -174,7 +170,7 @@ def _concat_xfade(clip_paths, durations, fade_dur, output):
            "-pix_fmt", "yuv420p",
            output]
     )
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
 
 if __name__ == "__main__":
