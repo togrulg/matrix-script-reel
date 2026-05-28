@@ -28,6 +28,7 @@ def handle_exception(e):
     return jsonify(error=str(e), traceback=tb[-3000:]), 500
 
 
+@app.route("/")
 @app.route("/health")
 def health():
     return "ok"
