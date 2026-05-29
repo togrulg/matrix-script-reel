@@ -256,16 +256,35 @@ def _render_reel_impl(job_id, data):
                 f.write(base64.b64decode(b64audio))
 
     if has_music:
+        import random
 
         mixed = os.path.join(tmp, "reel_music.mp4")
+
+        # Skip the quiet intro — start 15–25 s into the track so the music
+        # is already at full energy when the reel begins.
+        music_start = random.uniform(15, 25)
+
+        # Fade in over 1.5 s at the start; fade out over 2 s before the end.
+        # Total video duration is sum of slide durations.
+        video_dur = sum(durations)
+        fade_in_dur  = 1.5
+        fade_out_dur = 2.0
+        fade_out_start = max(0, video_dur - fade_out_dur)
+
+        audio_filter = (
+            f"afade=t=in:st=0:d={fade_in_dur},"
+            f"afade=t=out:st={fade_out_start:.3f}:d={fade_out_dur},"
+            f"volume={music_volume}"
+        )
+
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
-            "-i", output,                        # video (no audio)
-            "-i", audio_path,                    # music track
-            "-c:v", "copy",                      # don't re-encode video
-            "-c:a", "aac", "-b:a", "128k",       # encode audio as AAC
-            "-filter:a", f"volume={music_volume}",
-            "-shortest",                         # cut when video ends
+            "-i", output,                              # video (no audio)
+            "-ss", str(music_start), "-i", audio_path, # music starting at offset
+            "-c:v", "copy",                            # don't re-encode video
+            "-c:a", "aac", "-b:a", "128k",             # encode audio as AAC
+            "-filter:a", audio_filter,
+            "-shortest",                               # cut when video ends
             mixed,
         ]
         r2 = subprocess.run(cmd, stderr=subprocess.PIPE, timeout=120)
@@ -274,7 +293,7 @@ def _render_reel_impl(job_id, data):
             _log(f"  Music mix failed (continuing without music): {err}")
         else:
             output = mixed
-            _log("  Music mixed successfully")
+            _log(f"  Music mixed (start={music_start:.1f}s, fade-in={fade_in_dur}s, fade-out={fade_out_dur}s)")
 
     return output
 
