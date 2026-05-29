@@ -486,14 +486,32 @@ def bot_webhook():
     if WEBHOOK_SECRET:
         token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if token != WEBHOOK_SECRET:
+            _log(f"Webhook: bad secret token")
             return jsonify(ok=False), 403
 
     update = request.get_json(force=True, silent=True) or {}
 
-    if "callback_query" in update:
-        _bot_handle_callback(update["callback_query"])
-    elif "message" in update:
-        _bot_handle_message(update["message"])
+    # Log every incoming update for debugging
+    update_type = "callback_query" if "callback_query" in update else \
+                  "message"        if "message"        in update else \
+                  "other"
+    chat_type = ""
+    if "message" in update:
+        chat_type = update["message"].get("chat", {}).get("type", "?")
+        from_user = update["message"].get("from", {}).get("username") or \
+                    update["message"].get("from", {}).get("first_name", "?")
+        text_preview = (update["message"].get("text") or "")[:40]
+        _log(f"Webhook: {update_type} chat={chat_type} from=@{from_user} text={text_preview!r}")
+    else:
+        _log(f"Webhook: {update_type}")
+
+    try:
+        if "callback_query" in update:
+            _bot_handle_callback(update["callback_query"])
+        elif "message" in update:
+            _bot_handle_message(update["message"])
+    except Exception as e:
+        _log(f"Webhook handler error: {e}\n{traceback.format_exc()[-300:]}")
 
     return jsonify(ok=True)
 
