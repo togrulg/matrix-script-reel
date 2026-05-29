@@ -1,5 +1,6 @@
 import os
 import base64
+import json
 import subprocess
 import tempfile
 import traceback
@@ -13,6 +14,25 @@ from io import BytesIO
 from flask import Flask, request, send_file, jsonify
 
 app = Flask(__name__)
+
+# ── Telegram bot config ───────────────────────────────────────
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+GAS_SECRET     = os.environ.get("GAS_SECRET", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
+GAS_WEBAPP_URL = os.environ.get("GAS_WEBAPP_URL", "")
+TELEGRAM_API   = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# Per-user conversation state: { user_id: { step, topics, idea, chat_id, post_type, ... } }
+_BOT_STATE: dict = {}
+
+_POST_TYPES = [
+    ("reel",       "Рилс 🎬"),
+    ("carousel",   "Карусель 🖼️"),
+    ("image post", "Фото 📸"),
+    ("story",      "История ✨"),
+]
+_POST_TYPE_MAP = dict(_POST_TYPES)
 
 # ── In-process request log (last 40 entries) ─────────────────
 _LOG = deque(maxlen=40)
@@ -330,6 +350,368 @@ def _concat_xfade(clip_paths, durations, fade_dur, output):
     r.stderr = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else ""
     return r
 
+
+# ═══════════════════════════════════════════════════════════════
+# TELEGRAM BOT ROUTES
+# ═══════════════════════════════════════════════════════════════
+
+# ── Telegram helpers ──────────────────────────────────────────
+
+def _tg(method, payload, files=None):
+    if not BOT_TOKEN:
+        return {}
+    url = f"{TELEGRAM_API}/{method}"
+    try:
+        if files:
+            r = requests.post(url, data=payload, files=files, timeout=30)
+        else:
+            r = requests.post(url, json=payload, timeout=15)
+        return r.json()
+    except Exception as e:
+        _log(f"Telegram API [{method}] error: {e}")
+        return {}
+
+def _tg_send(chat_id, text, reply_markup=None, parse_mode="HTML"):
+    p = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup:
+        p["reply_markup"] = json.dumps(reply_markup)
+    return _tg("sendMessage", p)
+
+def _tg_edit(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
+    p = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup:
+        p["reply_markup"] = json.dumps(reply_markup)
+    _tg("editMessageText", p)
+
+def _tg_send_photo(chat_id, photo_url, caption="", reply_markup=None):
+    p = {"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
+    if reply_markup:
+        p["reply_markup"] = json.dumps(reply_markup)
+    return _tg("sendPhoto", p)
+
+def _tg_send_media_group(chat_id, photo_urls, caption=""):
+    media = []
+    for i, url in enumerate(photo_urls):
+        item = {"type": "photo", "media": url}
+        if i == 0 and caption:
+            item["caption"] = caption
+            item["parse_mode"] = "HTML"
+        media.append(item)
+    return _tg("sendMediaGroup", {"chat_id": chat_id, "media": json.dumps(media)})
+
+def _tg_send_video(chat_id, video_bytes, caption="", reply_markup=None):
+    p = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+    if reply_markup:
+        p["reply_markup"] = json.dumps(reply_markup)
+    return _tg("sendVideo", p, files={"video": ("reel.mp4", video_bytes, "video/mp4")})
+
+def _tg_answer_cb(callback_id, text=""):
+    _tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+# ── Keyboards ─────────────────────────────────────────────────
+
+def _topics_kb(topics):
+    return {"inline_keyboard": [
+        [{"text": f"{i+1}. {t[:80]}", "callback_data": f"topic:{i}"}]
+        for i, t in enumerate(topics)
+    ]}
+
+def _type_kb():
+    return {"inline_keyboard": [
+        [{"text": lbl, "callback_data": f"type:{code}"} for code, lbl in _POST_TYPES[:2]],
+        [{"text": lbl, "callback_data": f"type:{code}"} for code, lbl in _POST_TYPES[2:]],
+    ]}
+
+def _review_kb(row_id):
+    return {"inline_keyboard": [[
+        {"text": "✅ Одобрить",       "callback_data": f"approve:{row_id}"},
+        {"text": "🔄 Регенерировать", "callback_data": f"regen:{row_id}"},
+        {"text": "✏️ Новая идея",     "callback_data": f"newidea:{row_id}"},
+    ]]}
+
+# ── Topic expansion via Groq ───────────────────────────────────
+
+def _expand_topics(idea):
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not set")
+    system = (
+        "Ты — эксперт по контент-стратегии для Instagram в нише «Матрица Судьбы», "
+        "нумерология, эзотерика, личностный рост. Аудитория — русскоязычные женщины 25–45 лет. "
+        "По заданной грубой идее придумай ровно 5 конкретных, цепляющих тем для поста или рилса. "
+        "Каждая — одно завершённое предложение (макс. 15 слов), интригующий заголовок. "
+        "Темы разные по углу: вопрос, провокация, история, факт, практика. "
+        "Верни ТОЛЬКО JSON-массив из 5 строк — без пояснений, без markdown."
+    )
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        json={
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": f"Идея: {idea}"},
+            ],
+            "max_tokens": 600,
+            "temperature": 0.9,
+            "stream": False,
+        },
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    if "```" in raw:
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) > 1 else parts[0]
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+    topics = json.loads(raw.strip())
+    return [str(t).strip() for t in topics[:5]]
+
+# ── Webhook handler ───────────────────────────────────────────
+
+@app.route("/webhook", methods=["POST"])
+def bot_webhook():
+    if WEBHOOK_SECRET:
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if token != WEBHOOK_SECRET:
+            return jsonify(ok=False), 403
+
+    update = request.get_json(force=True, silent=True) or {}
+
+    if "callback_query" in update:
+        _bot_handle_callback(update["callback_query"])
+    elif "message" in update:
+        _bot_handle_message(update["message"])
+
+    return jsonify(ok=True)
+
+
+def _bot_handle_message(msg):
+    user_id  = msg["from"]["id"]
+    chat_id  = msg["chat"]["id"]
+    text     = (msg.get("text") or "").strip()
+    username = msg["from"].get("username") or msg["from"].get("first_name", "User")
+
+    if not text:
+        return
+
+    if text == "/start":
+        _BOT_STATE.pop(user_id, None)
+        _tg_send(chat_id,
+            "👋 <b>Matrix Script Bot</b>\n\n"
+            "Напиши идею для поста — я предложу 5 тем, ты выберешь нужную "
+            "и бот сгенерирует готовый контент.\n\n"
+            "<i>Пример: «хочу про деньги и матрицу судьбы»</i>")
+        return
+
+    if text.startswith("/"):
+        return
+
+    # Any non-command text → new idea
+    _BOT_STATE[user_id] = {"step": "idle", "chat_id": chat_id, "username": username}
+    thinking = _tg_send(chat_id, "🤔 <i>Анализирую идею и генерирую темы…</i>")
+    thinking_id = (thinking.get("result") or {}).get("message_id")
+
+    def _run():
+        try:
+            topics = _expand_topics(text)
+        except Exception as e:
+            _log(f"expand_topics error: {e}")
+            _tg_send(chat_id, f"❌ Не удалось сгенерировать темы:\n<code>{e}</code>")
+            return
+
+        _BOT_STATE[user_id].update(step="topics_shown", topics=topics, original_idea=text)
+        body = (
+            "💡 <b>Вот 5 тем по твоей идее:</b>\n\n"
+            + "\n".join(f"{i+1}. {t}" for i, t in enumerate(topics))
+            + "\n\n<i>Выбери одну:</i>"
+        )
+        if thinking_id:
+            _tg_edit(chat_id, thinking_id, body, reply_markup=_topics_kb(topics))
+        else:
+            _tg_send(chat_id, body, reply_markup=_topics_kb(topics))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _bot_handle_callback(cq):
+    user_id  = cq["from"]["id"]
+    chat_id  = cq["message"]["chat"]["id"]
+    msg_id   = cq["message"]["message_id"]
+    data     = cq.get("data", "")
+    username = cq["from"].get("username") or cq["from"].get("first_name", "User")
+
+    _tg_answer_cb(cq["id"])
+    state = _BOT_STATE.get(user_id, {})
+
+    if data.startswith("topic:"):
+        idx    = int(data.split(":")[1])
+        topics = state.get("topics", [])
+        if idx >= len(topics):
+            return
+        chosen = topics[idx]
+        _BOT_STATE[user_id] = {**state, "step": "type_shown", "idea": chosen}
+        _tg_edit(chat_id, msg_id,
+            f"✅ <b>Выбрана тема:</b>\n{chosen}\n\n<b>Выбери тип поста:</b>",
+            reply_markup=_type_kb())
+
+    elif data.startswith("type:"):
+        post_type = data.split(":", 1)[1]
+        idea      = state.get("idea", "")
+        if not idea:
+            _tg_send(chat_id, "❌ Что-то пошло не так. Начни заново — отправь идею.")
+            return
+        type_label = _POST_TYPE_MAP.get(post_type, post_type)
+        _BOT_STATE[user_id] = {**state, "step": "generating", "post_type": post_type}
+        _tg_edit(chat_id, msg_id,
+            f"✅ <b>Тема:</b> {idea}\n<b>Тип:</b> {type_label}\n\n"
+            f"⏳ <i>Отправляю в генерацию… обычно 3–5 минут. Пришлю как будет готово.</i>")
+        _bot_send_to_gas(chat_id, user_id, username, idea, post_type)
+
+    elif data.startswith("approve:"):
+        orig = cq["message"].get("text", "")
+        _tg_edit(chat_id, msg_id, orig + "\n\n✅ <b>Одобрено!</b>")
+        _tg_send(chat_id, "👍 Контент одобрен. Напиши новую идею когда будешь готов.")
+
+    elif data.startswith("regen:"):
+        idea      = state.get("idea", "")
+        post_type = state.get("post_type", "carousel")
+        if not idea:
+            _tg_send(chat_id, "❌ Не могу регенерировать — потеряна идея. Отправь заново.")
+            return
+        type_label = _POST_TYPE_MAP.get(post_type, post_type)
+        _BOT_STATE[user_id] = {**state, "step": "generating"}
+        _tg_edit(chat_id, msg_id,
+            f"🔄 <b>Регенерирую…</b>\n<b>Тема:</b> {idea}\n<b>Тип:</b> {type_label}\n\n"
+            f"⏳ <i>Подожди 3–5 минут.</i>")
+        _bot_send_to_gas(chat_id, user_id, username, idea, post_type)
+
+    elif data.startswith("newidea:"):
+        _BOT_STATE.pop(user_id, None)
+        orig = cq["message"].get("text", "")
+        _tg_edit(chat_id, msg_id, orig + "\n\n✏️ <i>Начинаем заново.</i>")
+        _tg_send(chat_id, "✏️ Напиши новую идею для поста:")
+
+
+def _bot_send_to_gas(chat_id, user_id, username, idea, post_type):
+    if not GAS_WEBAPP_URL:
+        _tg_send(chat_id, "❌ GAS_WEBAPP_URL не настроен. Обратись к администратору.")
+        return
+    try:
+        resp = requests.post(GAS_WEBAPP_URL, json={
+            "action":   "generate",
+            "idea":     idea,
+            "postType": post_type,
+            "chatId":   chat_id,
+            "userId":   user_id,
+            "username": username,
+            "secret":   GAS_SECRET,
+        }, timeout=30)
+        data = resp.json()
+        if data.get("status") != "queued":
+            raise Exception(data.get("error") or resp.text[:200])
+    except Exception as e:
+        _log(f"GAS request failed: {e}")
+        _tg_send(chat_id, f"❌ Не удалось запустить генерацию:\n<code>{e}</code>")
+        _BOT_STATE.get(user_id, {}).update(step="idle")
+
+
+# ── GAS callback endpoint ─────────────────────────────────────
+
+@app.route("/gas_callback", methods=["POST"])
+def gas_callback():
+    body = request.get_json(force=True, silent=True) or {}
+
+    if GAS_SECRET and body.get("secret") != GAS_SECRET:
+        return jsonify(ok=False, error="forbidden"), 403
+
+    event     = body.get("event", "")
+    chat_id   = body.get("chatId")
+    row_id    = str(body.get("rowId", ""))
+    post_type = body.get("postType", "")
+
+    if not chat_id:
+        return jsonify(ok=False, error="missing chatId"), 400
+
+    _log(f"gas_callback event={event} chatId={chat_id} rowId={row_id}")
+
+    if event == "content_ready":
+        hook     = body.get("hook", "")
+        slides   = body.get("slides", [])
+        caption  = body.get("caption", "")
+        type_label = _POST_TYPE_MAP.get(post_type, post_type)
+
+        slides_fmt = ""
+        for i, s in enumerate(slides):
+            if "|" in s:
+                head, sub = s.split("|", 1)
+                slides_fmt += f"\n<b>{i+1}. {head.strip()}</b>\n<i>{sub.strip()}</i>"
+            else:
+                slides_fmt += f"\n{i+1}. {s}"
+
+        msg = (
+            f"✅ <b>Контент готов!</b> ({type_label})\n\n"
+            f"🎣 <b>Hook:</b>\n{hook}\n\n"
+            f"📋 <b>Слайды:</b>{slides_fmt}\n\n"
+            f"📝 <b>Подпись:</b>\n{caption[:250]}…\n\n"
+            f"<i>Изображения скоро придут отдельным сообщением.</i>"
+        )
+        _tg_send(chat_id, msg)
+
+    elif event == "images_ready":
+        thumb_urls = body.get("thumbUrls", [])
+        if len(thumb_urls) == 1:
+            _tg_send_photo(chat_id, thumb_urls[0],
+                           caption="🖼️ Готовые слайды:",
+                           reply_markup=_review_kb(row_id))
+        elif len(thumb_urls) > 1:
+            _tg_send_media_group(chat_id, thumb_urls, caption="🖼️ Готовые слайды:")
+            _tg_send(chat_id, "👆 Проверь слайды:", reply_markup=_review_kb(row_id))
+        else:
+            _tg_send(chat_id, "✅ Слайды готовы.", reply_markup=_review_kb(row_id))
+
+    elif event == "reel_ready":
+        video_b64 = body.get("videoB64", "")
+        video_url = body.get("videoUrl", "")
+        if video_b64:
+            video_bytes = base64.b64decode(video_b64)
+            _tg_send_video(chat_id, video_bytes,
+                           caption="🎬 Рилс готов!",
+                           reply_markup=_review_kb(row_id))
+        elif video_url:
+            _tg_send(chat_id,
+                     f"🎬 <b>Рилс готов!</b>\n<a href=\"{video_url}\">Скачать MP4</a>",
+                     reply_markup=_review_kb(row_id))
+        else:
+            _tg_send(chat_id, "🎬 Рилс готов! Проверь папку на Google Drive.",
+                     reply_markup=_review_kb(row_id))
+
+    elif event == "error":
+        msg = body.get("message", "Неизвестная ошибка")
+        _tg_send(chat_id, f"❌ <b>Ошибка генерации:</b>\n<code>{msg}</code>")
+
+    return jsonify(ok=True)
+
+
+@app.route("/set_webhook")
+def set_webhook():
+    base = request.args.get("url", "").rstrip("/")
+    if not base:
+        return "Pass ?url=https://your-domain.onrender.com", 400
+    payload = {"url": f"{base}/webhook"}
+    if WEBHOOK_SECRET:
+        payload["secret_token"] = WEBHOOK_SECRET
+    r = requests.post(f"{TELEGRAM_API}/setWebhook", json=payload, timeout=10)
+    return jsonify(r.json())
+
+
+@app.route("/webhook_info")
+def webhook_info():
+    r = requests.get(f"{TELEGRAM_API}/getWebhookInfo", timeout=10)
+    return jsonify(r.json())
+
+
+# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
