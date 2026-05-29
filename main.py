@@ -459,12 +459,24 @@ def _expand_topics(idea):
     )
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
+
+    # Strip markdown fences if present
     if "```" in raw:
         parts = raw.split("```")
         raw = parts[1] if len(parts) > 1 else parts[0]
         if raw.lower().startswith("json"):
             raw = raw[4:]
-    topics = json.loads(raw.strip())
+    raw = raw.strip()
+
+    # Extract just the [...] array — model sometimes adds extra text before/after
+    start = raw.find("[")
+    end   = raw.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        raw = raw[start:end + 1]
+
+    topics = json.loads(raw)
+    if not isinstance(topics, list):
+        raise ValueError("Expected a JSON array")
     return [str(t).strip() for t in topics[:5]]
 
 # ── Webhook handler ───────────────────────────────────────────
