@@ -150,6 +150,202 @@ def _run_job(job_id, data):
 
 
 def _render_reel_impl(job_id, data):
+    # Route to video-clip compositing or legacy still-image slideshow
+    if data.get("mode") == "video" or data.get("videos"):
+        return _render_with_video_clips(job_id, data)
+    return _render_with_still_images(job_id, data)
+
+
+def _render_with_video_clips(job_id, data):
+    """
+    Option A: video B-roll + chroma-key text overlay.
+    For each slide:
+      1. Download MP4 clip (Pexels/Pixabay CDN URL — no auth needed)
+      2. Download chroma-green text overlay PNG (Drive URL)
+      3. FFmpeg: normalize clip to target size, trim to slide_dur
+      4. FFmpeg: colorkey to remove green from overlay, composite on clip
+    Then: concat all composited clips → add music → return MP4.
+    """
+    videos       = data.get("videos", [])
+    overlays     = data.get("overlays", [])
+    durations    = data.get("durations", [])
+    fade_dur     = float(data.get("fade_dur", 0.5))
+    music_url    = data.get("music_url")
+    music_volume = float(data.get("music_volume", 0.3))
+    width        = int(data.get("width",  720))
+    height       = int(data.get("height", 1280))
+
+    if not videos:
+        raise ValueError("Video mode: no video URLs provided")
+    if len(durations) != len(videos):
+        durations = [7.0] * len(videos)
+    # Overlay list is optional — if shorter than videos, remaining slides get no overlay
+    while len(overlays) < len(videos):
+        overlays.append(None)
+
+    tmp = tempfile.mkdtemp(prefix=f"vreel_{job_id[:8]}_")
+    _log(f"Job {job_id[:8]} [VIDEO]: {len(videos)} clips, {width}x{height}")
+
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    composited_paths = []
+
+    for i, (video_url, overlay_url, dur) in enumerate(zip(videos, overlays, durations)):
+        _log(f"  Clip {i+1}/{len(videos)}: downloading…")
+
+        # ── 1. Download video clip ─────────────────────────────
+        clip_raw = os.path.join(tmp, f"clip_raw_{i:03d}.mp4")
+        resp = sess.get(video_url, timeout=90, allow_redirects=True, stream=True)
+        if resp.status_code != 200:
+            raise ValueError(f"Clip {i+1} download failed: HTTP {resp.status_code} — {video_url[:100]}")
+        with open(clip_raw, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024*1024):
+                f.write(chunk)
+        _log(f"  Clip {i+1}: {os.path.getsize(clip_raw)//1024}KB downloaded")
+
+        # ── 2. Download overlay PNG ────────────────────────────
+        overlay_raw = None
+        if overlay_url:
+            overlay_raw = os.path.join(tmp, f"overlay_{i:03d}.png")
+            resp2 = sess.get(overlay_url, timeout=60, allow_redirects=True)
+            if resp2.status_code == 200:
+                with open(overlay_raw, "wb") as f:
+                    f.write(resp2.content)
+                _log(f"  Overlay {i+1}: {len(resp2.content)//1024}KB downloaded")
+            else:
+                _log(f"  Overlay {i+1}: download failed HTTP {resp2.status_code} — skipping overlay")
+                overlay_raw = None
+
+        # ── 3+4. Normalize clip + composite overlay ────────────
+        composited = os.path.join(tmp, f"comp_{i:03d}.mp4")
+        fade_in  = 0.0 if i == 0              else fade_dur
+        fade_out = 0.0 if i == len(videos) - 1 else fade_dur
+
+        if overlay_raw and os.path.exists(overlay_raw):
+            # Scale video to fill target canvas (portrait crop), trim, apply fades,
+            # then overlay the chroma-keyed text PNG on top.
+            vf_parts = [
+                f"scale={width}:{height}:force_original_aspect_ratio=increase",
+                f"crop={width}:{height}",
+                "setsar=1",
+                "fps=24",
+            ]
+            if fade_in  > 0: vf_parts.append(f"fade=t=in:st=0:d={fade_in}")
+            if fade_out > 0: vf_parts.append(f"fade=t=out:st={max(0, dur - fade_out):.3f}:d={fade_out}")
+            # Scale overlay to match target canvas
+            ovl_vf = f"scale={width}:{height}," \
+                     f"colorkey=color=00ff00:similarity=0.25:blend=0.05"
+            filter_complex = (
+                f"[0:v]{','.join(vf_parts)}[bg];"
+                f"[1:v]{ovl_vf}[txt];"
+                f"[bg][txt]overlay=0:0[out]"
+            )
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", "0", "-t", str(dur), "-i", clip_raw,
+                "-i", overlay_raw,
+                "-filter_complex", filter_complex,
+                "-map", "[out]",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", "26", "-pix_fmt", "yuv420p",
+                composited,
+            ]
+        else:
+            # No overlay — just normalize + fade + trim
+            vf_parts = [
+                f"scale={width}:{height}:force_original_aspect_ratio=increase",
+                f"crop={width}:{height}",
+                "setsar=1",
+                "fps=24",
+            ]
+            if fade_in  > 0: vf_parts.append(f"fade=t=in:st=0:d={fade_in}")
+            if fade_out > 0: vf_parts.append(f"fade=t=out:st={max(0, dur - fade_out):.3f}:d={fade_out}")
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", "0", "-t", str(dur), "-i", clip_raw,
+                "-vf", ",".join(vf_parts),
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", "26", "-pix_fmt", "yuv420p",
+                composited,
+            ]
+
+        r = subprocess.run(cmd, stderr=subprocess.PIPE, timeout=240)
+        if r.returncode != 0:
+            raise RuntimeError(f"FFmpeg composite {i+1} failed: {r.stderr.decode(errors='replace')[-400:]}")
+
+        # Free disk: remove raw downloads immediately
+        try: os.remove(clip_raw)
+        except: pass
+        if overlay_raw:
+            try: os.remove(overlay_raw)
+            except: pass
+
+        composited_paths.append(composited)
+        _log(f"  Clip {i+1}/{len(videos)} composited ({os.path.getsize(composited)//1024}KB)")
+
+    # ── Concatenate all composited clips ──────────────────────
+    output = os.path.join(tmp, "reel.mp4")
+    concat_txt = os.path.join(tmp, "concat.txt")
+    with open(concat_txt, "w") as f:
+        for c in composited_paths:
+            f.write(f"file '{c}'\n")
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-f", "concat", "-safe", "0", "-i", concat_txt,
+           "-c", "copy", output]
+    r = subprocess.run(cmd, stderr=subprocess.PIPE, timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError(f"FFmpeg concat failed: {r.stderr.decode(errors='replace')[-400:]}")
+    _log(f"  Concat done → {os.path.getsize(output)//1024}KB")
+
+    # ── Mix background music ───────────────────────────────────
+    if music_url:
+        output = _mix_music(output, music_url, durations, music_volume, tmp, sess, job_id)
+
+    return output
+
+
+def _mix_music(video_path, music_url, durations, music_volume, tmp, sess, job_id):
+    """Download music and mix it into the video. Returns path to mixed output."""
+    import random
+    audio_path = os.path.join(tmp, "music.mp3")
+    _log(f"  Downloading music: {music_url[:80]}")
+    resp = sess.get(music_url, timeout=60, allow_redirects=True)
+    if resp.status_code != 200:
+        _log(f"  Music download failed HTTP {resp.status_code} — skipping")
+        return video_path
+    with open(audio_path, "wb") as f:
+        f.write(resp.content)
+
+    mixed = os.path.join(tmp, "reel_music.mp4")
+    video_dur    = sum(durations)
+    music_start  = random.uniform(15, 25)
+    fade_out_start = max(0, video_dur - 2.0)
+    audio_filter = (
+        f"afade=t=in:st=0:d=1.5,"
+        f"afade=t=out:st={fade_out_start:.3f}:d=2.0,"
+        f"volume={music_volume}"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", video_path,
+        "-ss", str(music_start), "-i", audio_path,
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k",
+        "-filter:a", audio_filter,
+        "-shortest",
+        mixed,
+    ]
+    r = subprocess.run(cmd, stderr=subprocess.PIPE, timeout=120)
+    if r.returncode != 0:
+        _log(f"  Music mix failed — continuing without: {r.stderr.decode(errors='replace')[-200:]}")
+        return video_path
+    _log(f"  Music mixed (start={music_start:.1f}s)")
+    return mixed
+
+
+def _render_with_still_images(job_id, data):
+    """Legacy still-image slideshow (original implementation)."""
     images       = data.get("images", [])
     durations    = data.get("durations", [])
     fade_dur     = float(data.get("fade_dur", 0.5))
@@ -251,69 +447,30 @@ def _render_reel_impl(job_id, data):
         raise RuntimeError(f"FFmpeg concat failed: {r.stderr[-500:]}")
 
     # ── 4. Mix in background music (optional) ─────────────────
-    has_music = music_data or music_url
-    if has_music:
-        _log(f"  Mixing background music (volume={music_volume})…")
-        audio_path = os.path.join(tmp, "music.mp3")
-
-        if music_url:
-            # Download directly from Jamendo (or any public URL)
-            _log(f"  Downloading music from: {music_url[:80]}")
-            resp = sess.get(music_url, timeout=60, allow_redirects=True)
-            if resp.status_code != 200:
-                _log(f"  Music download failed HTTP {resp.status_code} — skipping")
-                has_music = False
-            else:
-                with open(audio_path, "wb") as f:
-                    f.write(resp.content)
-        else:
-            # Legacy: base64 data URI
-            if "," in music_data:
-                _, b64audio = music_data.split(",", 1)
-            else:
-                b64audio = music_data
-            with open(audio_path, "wb") as f:
-                f.write(base64.b64decode(b64audio))
-
-    if has_music:
+    if music_url:
+        output = _mix_music(output, music_url, durations, music_volume, tmp, sess, job_id)
+    elif music_data:
+        # Legacy: base64 data URI — decode, write, mix inline
         import random
-
+        audio_path = os.path.join(tmp, "music_legacy.mp3")
+        b64audio = music_data.split(",", 1)[1] if "," in music_data else music_data
+        with open(audio_path, "wb") as f:
+            f.write(base64.b64decode(b64audio))
         mixed = os.path.join(tmp, "reel_music.mp4")
-
-        # Skip the quiet intro — start 15–25 s into the track so the music
-        # is already at full energy when the reel begins.
-        music_start = random.uniform(15, 25)
-
-        # Fade in over 1.5 s at the start; fade out over 2 s before the end.
-        # Total video duration is sum of slide durations.
-        video_dur = sum(durations)
-        fade_in_dur  = 1.5
-        fade_out_dur = 2.0
-        fade_out_start = max(0, video_dur - fade_out_dur)
-
-        audio_filter = (
-            f"afade=t=in:st=0:d={fade_in_dur},"
-            f"afade=t=out:st={fade_out_start:.3f}:d={fade_out_dur},"
-            f"volume={music_volume}"
-        )
-
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", output,                              # video (no audio)
-            "-ss", str(music_start), "-i", audio_path, # music starting at offset
-            "-c:v", "copy",                            # don't re-encode video
-            "-c:a", "aac", "-b:a", "128k",             # encode audio as AAC
-            "-filter:a", audio_filter,
-            "-shortest",                               # cut when video ends
-            mixed,
-        ]
+        video_dur      = sum(durations)
+        music_start    = random.uniform(15, 25)
+        fade_out_start = max(0, video_dur - 2.0)
+        audio_filter   = (f"afade=t=in:st=0:d=1.5,"
+                          f"afade=t=out:st={fade_out_start:.3f}:d=2.0,"
+                          f"volume={music_volume}")
+        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+               "-i", output,
+               "-ss", str(music_start), "-i", audio_path,
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+               "-filter:a", audio_filter, "-shortest", mixed]
         r2 = subprocess.run(cmd, stderr=subprocess.PIPE, timeout=120)
-        if r2.returncode != 0:
-            err = r2.stderr.decode(errors="replace")[-300:]
-            _log(f"  Music mix failed (continuing without music): {err}")
-        else:
+        if r2.returncode == 0:
             output = mixed
-            _log(f"  Music mixed (start={music_start:.1f}s, fade-in={fade_in_dur}s, fade-out={fade_out_dur}s)")
 
     return output
 
