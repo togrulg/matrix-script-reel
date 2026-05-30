@@ -20,25 +20,38 @@ SYSTEM_PROMPT = """Ты — эксперт по контент-стратеги�
 
 def expand_topics(idea: str) -> list:
     """Return 5 specific Instagram topic ideas for the given rough idea."""
-    resp = requests.post(
-        GROQ_ENDPOINT,
-        json={
-            'model':       GROQ_MODEL,
-            'messages': [
-                {'role': 'system', 'content': SYSTEM_PROMPT},
-                {'role': 'user',   'content': f'Идея: {idea}'},
-            ],
-            'max_tokens':  600,
-            'temperature': 0.9,
-            'stream':      False,
-        },
-        headers={
-            'Authorization': f'Bearer {GROQ_API_KEY}',
-            'Content-Type':  'application/json',
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
+    import time
+    last_err = None
+    for attempt in range(3):
+        resp = requests.post(
+            GROQ_ENDPOINT,
+            json={
+                'model':       GROQ_MODEL,
+                'messages': [
+                    {'role': 'system', 'content': SYSTEM_PROMPT},
+                    {'role': 'user',   'content': f'Идея: {idea}'},
+                ],
+                'max_tokens':  600,
+                'temperature': 0.9,
+                'stream':      False,
+            },
+            headers={
+                'Authorization': f'Bearer {GROQ_API_KEY}',
+                'Content-Type':  'application/json',
+            },
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            wait = 15 * (attempt + 1)
+            print(f"Groq 429 — waiting {wait}s (attempt {attempt+1}/3)", flush=True)
+            time.sleep(wait)
+            last_err = 'Groq rate limit — подожди минуту и попробуй снова'
+            continue
+        resp.raise_for_status()
+        last_err = None
+        break
+    if last_err:
+        raise RuntimeError(last_err)
 
     raw = resp.json()['choices'][0]['message']['content'].strip()
 
