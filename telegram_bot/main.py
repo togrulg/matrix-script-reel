@@ -302,6 +302,32 @@ def _handle_message(msg):
     if text.startswith('/'):
         return
 
+    # ── Block new idea if generation is already in progress ───
+    _BUSY_STEPS = {'generating_content', 'generating_media', 'awaiting_confirm',
+                   'topics_shown', 'type_shown', 'tone_shown', 'source_shown',
+                   'template_shown', 'music_shown'}
+    current_step = _STATE.get(user_id, {}).get('step', 'idle')
+    if current_step in _BUSY_STEPS:
+        idea_in_progress = _STATE[user_id].get('idea', '…')
+        step_labels = {
+            'generating_content': '⏳ генерирую контент',
+            'generating_media':   '⏳ генерирую изображения',
+            'awaiting_confirm':   '✅ жду твоего подтверждения',
+            'topics_shown':       '💡 жду выбора темы',
+            'type_shown':         '📋 жду выбора типа поста',
+            'tone_shown':         '🎨 жду выбора тона',
+            'source_shown':       '📸 жду выбора источника изображений',
+            'template_shown':     '🖼️ жду выбора шаблона',
+            'music_shown':        '🎵 жду выбора музыки',
+        }
+        step_label = step_labels.get(current_step, current_step)
+        send(chat_id,
+             f'⚙️ <b>Уже идёт генерация!</b>\n\n'
+             f'Тема: <i>{idea_in_progress}</i>\n'
+             f'Статус: {step_label}\n\n'
+             f'Дождись завершения или нажми /cancel чтобы отменить и начать заново.')
+        return
+
     # ── New idea ──────────────────────────────────────────────
     _STATE[user_id] = {'step': 'idle', 'chat_id': chat_id, 'username': username}
     thinking = send(chat_id, '🤔 <i>Анализирую идею и генерирую темы…</i>')
