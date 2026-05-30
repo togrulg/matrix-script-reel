@@ -372,7 +372,18 @@ def _handle_message(msg):
         return
 
     if text in ('/cancel', '/reset'):
-        prev_step = _STATE.get(user_id, {}).get('step', '')
+        prev_state = _STATE.get(user_id, {})
+        prev_step  = prev_state.get('step', '')
+        if prev_step == 'awaiting_edit':
+            # Cancel edit mode — clean up helper messages and go back to confirm
+            val_msg = prev_state.get('edit_val_msg')
+            fr_msg  = prev_state.get('edit_fr_msg')
+            if val_msg: _tg('deleteMessage', {'chat_id': chat_id, 'message_id': val_msg})
+            if fr_msg:  _tg('deleteMessage', {'chat_id': chat_id, 'message_id': fr_msg})
+            _STATE[user_id] = {**prev_state, 'step': 'awaiting_confirm',
+                               'edit_field': None, 'edit_val_msg': None, 'edit_fr_msg': None}
+            send(chat_id, '❌ Редактирование отменено. Нажми ✅ чтобы продолжить или выбери другое поле.')
+            return
         _STATE.pop(user_id, None)
         if prev_step in ('generating_media', 'generating_content'):
             send(chat_id,
@@ -413,19 +424,30 @@ def _handle_message(msg):
         row_id    = state.get('row_id', '')
         field     = state.get('edit_field', '')
         post_type = state.get('post_type', '')
+        val_msg   = state.get('edit_val_msg')
+        fr_msg    = state.get('edit_fr_msg')
+
         if not row_id or not field:
             _STATE[user_id]['step'] = 'awaiting_confirm'
             send(chat_id, '❌ Потеряна ссылка на контент. Начни заново.')
             return
-        # Normalise slides input: user may use "---" as separator
+
+        # Clean up the code-block and force-reply helper messages
+        if val_msg:
+            _tg('deleteMessage', {'chat_id': chat_id, 'message_id': val_msg})
+        if fr_msg:
+            _tg('deleteMessage', {'chat_id': chat_id, 'message_id': fr_msg})
+
+        # Normalise slides: accept "---" as separator
         new_value = text.strip()
         if field == 'slides':
-            # Normalise: accept bare "---" lines as separator
             new_value = '\n---\n'.join(
                 p.strip() for p in new_value.replace('\n---\n', '|||').replace('---', '|||').split('|||')
                 if p.strip()
             )
-        _STATE[user_id]['step'] = 'awaiting_confirm'
+
+        _STATE[user_id] = {**state, 'step': 'awaiting_confirm',
+                           'edit_field': None, 'edit_val_msg': None, 'edit_fr_msg': None}
         send(chat_id, '⏳ <i>Сохраняю правки…</i>')
         _send_field_update(chat_id, user_id, row_id, field, new_value, post_type)
         return
@@ -635,25 +657,86 @@ def _handle_callback(cq):
 
     elif data.startswith('editback:'):
         row_id = data.split(':', 1)[1]
+        _STATE[user_id] = {**state, 'step': 'awaiting_confirm'}
         edit_msg(chat_id, msg_id,
                  cq['message'].get('text', '').split('\n\n<b>Что хочешь изменить?</b>')[0],
                  reply_markup=_confirm_kb(row_id))
 
+    elif data.startswith('editcancel:'):
+        # editcancel:{row_id}:{picker_msg_id}
+        parts          = data.split(':', 2)
+        row_id         = parts[1] if len(parts) > 1 else ''
+        picker_msg_id  = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else msg_id
+        # Clean up the code-block and force-reply messages if we know their IDs
+        val_msg  = state.get('edit_val_msg')
+        fr_msg   = state.get('edit_fr_msg')
+        if val_msg:
+            _tg('deleteMessage', {'chat_id': chat_id, 'message_id': val_msg})
+        if fr_msg:
+            _tg('deleteMessage', {'chat_id': chat_id, 'message_id': fr_msg})
+        # Restore confirm keyboard on the picker message
+        _STATE[user_id] = {**state, 'step': 'awaiting_confirm',
+                           'edit_field': None, 'edit_val_msg': None, 'edit_fr_msg': None}
+        post_type = state.get('post_type', '')
+        edit_msg(chat_id, picker_msg_id,
+                 f'✏️ <b>Редактирование отменено.</b>\n\n<b>Что хочешь изменить?</b>',
+                 reply_markup=_edit_field_kb(row_id, post_type))
+
     elif data.startswith('editfield:'):
-        parts = data.split(':', 2)
+        parts  = data.split(':', 2)
         row_id = parts[1] if len(parts) > 1 else ''
         field  = parts[2] if len(parts) > 2 else ''
+
+        # Read current value from last known content
+        last   = _LAST.get(user_id, {})
+        if field == 'hook':
+            cur_val = last.get('hook', '')
+        elif field == 'slides':
+            slides = last.get('slides', [])
+            cur_val = '\n---\n'.join(slides)
+        elif field == 'caption':
+            cur_val = last.get('caption', '')
+        elif field == 'hashtags':
+            cur_val = last.get('hashtags', '')
+        else:
+            cur_val = ''
+
+        lbl = EDIT_FIELD_LABELS.get(field, field)
+
+        # Edit the picker message to show current value + cancel button
+        edit_msg(chat_id, msg_id,
+                 f'✏️ <b>Редактирую: {lbl}</b>\n\n'
+                 f'<b>Текущий текст</b> (скопируй, измени и отправь):',
+                 reply_markup={'inline_keyboard': [[
+                     {'text': '❌ Отмена', 'callback_data': f'editcancel:{row_id}:{msg_id}'}
+                 ]]})
+
+        # Send the current value as a standalone code block — one tap copies on mobile
+        val_msg = _tg('sendMessage', {
+            'chat_id'    : chat_id,
+            'text'       : f'<code>{cur_val}</code>' if cur_val else '<i>(пусто)</i>',
+            'parse_mode' : 'HTML',
+        })
+        val_msg_id = (val_msg.get('result') or {}).get('message_id')
+
+        # Force-reply prompt so Telegram auto-opens the reply field
+        fr_msg = _tg('sendMessage', {
+            'chat_id'      : chat_id,
+            'text'         : f'⬆️ Скопируй текст выше, измени и отправь в ответ.\n<i>/cancel — отмена</i>',
+            'parse_mode'   : 'HTML',
+            'reply_markup' : json.dumps({'force_reply': True, 'selective': True}),
+        })
+        fr_msg_id = (fr_msg.get('result') or {}).get('message_id')
+
         _STATE[user_id] = {
             **state,
-            'step'       : 'awaiting_edit',
-            'row_id'     : row_id,
-            'edit_field' : field,
-            'edit_msg_id': msg_id,
+            'step'          : 'awaiting_edit',
+            'row_id'        : row_id,
+            'edit_field'    : field,
+            'edit_msg_id'   : msg_id,       # picker message (has cancel button)
+            'edit_val_msg'  : val_msg_id,   # code block message (to delete after submit)
+            'edit_fr_msg'   : fr_msg_id,    # force-reply message (to delete after submit)
         }
-        hint = EDIT_FIELD_HINTS.get(field, 'Отправь новое значение:')
-        edit_msg(chat_id, msg_id,
-                 cq['message'].get('text', '').split('\n\n<b>Что хочешь изменить?</b>')[0] +
-                 f'\n\n{hint}')
 
     # ── Regen content ──────────────────────────────────────────
     elif data.startswith('regen_content:'):
@@ -857,11 +940,14 @@ def _send_field_update(chat_id, user_id, row_id, field, new_value, post_type):
         }, timeout=30)
         data = resp.json()
         if data.get('status') == 'ok':
-            # GAS returns updated content — re-show preview
+            # GAS returns updated content — refresh _LAST and re-show preview
             body = data.get('content', {})
             body['postType'] = post_type
             if not body.get('rowId'):
                 body['rowId'] = row_id
+            # Update _LAST so next edit shows the freshly saved value
+            if user_id:
+                _LAST[user_id] = {**(_LAST.get(user_id) or {}), **body}
             send(chat_id, f'✅ <b>{EDIT_FIELD_LABELS.get(field, field)}</b> обновлён.')
             _send_content_preview(chat_id, body, row_id)
         else:
