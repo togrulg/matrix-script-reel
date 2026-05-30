@@ -28,25 +28,111 @@ BOT_TOKEN      = os.environ.get('BOT_TOKEN', '')
 GAS_WEBAPP_URL = os.environ.get('GAS_WEBAPP_URL', '')
 GAS_SECRET     = os.environ.get('GAS_SECRET', '')
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')
-REDIS_URL      = os.environ.get('REDIS_URL', '')
-TELEGRAM_API   = f'https://api.telegram.org/bot{BOT_TOKEN}'
+REDIS_URL           = os.environ.get('REDIS_URL', '')
+UPSTASH_REDIS_URL   = os.environ.get('UPSTASH_REDIS_REST_URL', '')
+UPSTASH_REDIS_TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
+TELEGRAM_API        = f'https://api.telegram.org/bot{BOT_TOKEN}'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Redis (optional — set REDIS_URL env var to enable persistence) ────────────
-_redis = None
+# ── Redis (optional) ──────────────────────────────────────────
+# Supports two backends:
+#   1. REDIS_URL (redis-py / any Redis)
+#   2. UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN (Upstash REST API — no redis-py needed)
+# Falls back to in-memory if neither is configured.
+
+_redis      = None   # redis-py client
+_upstash    = None   # (base_url, token) tuple for REST API
+
 if REDIS_URL:
     try:
         import redis as _redis_lib
         _redis = _redis_lib.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
         _redis.ping()
-        log.info('Redis connected: %s', REDIS_URL[:40])
+        log.info('Redis (redis-py) connected')
     except Exception as _re:
-        log.warning('Redis unavailable (%s) — falling back to in-memory state', _re)
+        log.warning('Redis unavailable (%s) — falling back to in-memory', _re)
         _redis = None
+
+if not _redis and UPSTASH_REDIS_URL and UPSTASH_REDIS_TOKEN:
+    _upstash = (UPSTASH_REDIS_URL.rstrip('/'), UPSTASH_REDIS_TOKEN)
+    log.info('Upstash REST API configured: %s', UPSTASH_REDIS_URL[:50])
+
+
+def _kv_get(key: str):
+    """Get a string value from whichever KV backend is active."""
+    if _redis:
+        return _redis.get(key)
+    if _upstash:
+        base, token = _upstash
+        try:
+            r = requests.get(f'{base}/get/{key}',
+                             headers={'Authorization': f'Bearer {token}'}, timeout=3)
+            data = r.json()
+            return data.get('result')  # None if key missing
+        except Exception as e:
+            log.warning('Upstash GET %s: %s', key, e)
+    return None
+
+
+def _kv_setex(key: str, ttl: int, value: str):
+    """Set a key with TTL (seconds)."""
+    if _redis:
+        _redis.setex(key, ttl, value)
+        return
+    if _upstash:
+        base, token = _upstash
+        try:
+            requests.post(f'{base}/set/{key}/{requests.utils.quote(value, safe="")}',
+                          params={'ex': ttl},
+                          headers={'Authorization': f'Bearer {token}'}, timeout=3)
+        except Exception as e:
+            log.warning('Upstash SET %s: %s', key, e)
+
+
+def _kv_delete(key: str):
+    """Delete a key."""
+    if _redis:
+        _redis.delete(key)
+        return
+    if _upstash:
+        base, token = _upstash
+        try:
+            requests.post(f'{base}/del/{key}',
+                          headers={'Authorization': f'Bearer {token}'}, timeout=3)
+        except Exception as e:
+            log.warning('Upstash DEL %s: %s', key, e)
+
+
+def _kv_scan(pattern: str):
+    """Return all keys matching a pattern (best-effort)."""
+    if _redis:
+        return list(_redis.scan_iter(pattern))
+    if _upstash:
+        base, token = _upstash
+        keys = []
+        cursor = 0
+        try:
+            while True:
+                r = requests.get(f'{base}/scan/{cursor}',
+                                 params={'match': pattern, 'count': 200},
+                                 headers={'Authorization': f'Bearer {token}'}, timeout=5)
+                result = r.json().get('result', [cursor + 1, []])
+                cursor = int(result[0])
+                keys.extend(result[1])
+                if cursor == 0:
+                    break
+        except Exception as e:
+            log.warning('Upstash SCAN %s: %s', pattern, e)
+        return keys
+    return []
+
+
+def _kv_active():
+    return bool(_redis or _upstash)
 
 
 class PersistentDict:
@@ -66,12 +152,11 @@ class PersistentDict:
     # ── dict interface ──────────────────────────────────────────
     def __setitem__(self, key, value):
         self._d[key] = value
-        if _redis:
+        if _kv_active():
             try:
-                _redis.setex(f'{self._prefix}:{key}', self._TTL,
-                             json.dumps(value, default=str))
+                _kv_setex(f'{self._prefix}:{key}', self._TTL, json.dumps(value, default=str))
             except Exception as e:
-                log.warning('Redis write [%s:%s]: %s', self._prefix, key, e)
+                log.warning('KV write [%s:%s]: %s', self._prefix, key, e)
 
     def __getitem__(self, key):
         return self._d[key]
@@ -86,11 +171,11 @@ class PersistentDict:
         return self._d.get(key, default)
 
     def pop(self, key, *args):
-        if _redis:
+        if _kv_active():
             try:
-                _redis.delete(f'{self._prefix}:{key}')
+                _kv_delete(f'{self._prefix}:{key}')
             except Exception as e:
-                log.warning('Redis delete [%s:%s]: %s', self._prefix, key, e)
+                log.warning('KV delete [%s:%s]: %s', self._prefix, key, e)
         return self._d.pop(key, *args)
 
     def update_key(self, key, patch: dict):
@@ -101,21 +186,21 @@ class PersistentDict:
 
     # ── persistence ─────────────────────────────────────────────
     def load(self):
-        """Load all entries from Redis into memory (called once at startup)."""
-        if not _redis:
+        """Load all entries from KV store into memory (called once at startup)."""
+        if not _kv_active():
             return
         try:
-            for rkey in _redis.scan_iter(f'{self._prefix}:*'):
+            for rkey in _kv_scan(f'{self._prefix}:*'):
                 try:
-                    uid = int(rkey.split(':', 1)[1])
-                    raw = _redis.get(rkey)
+                    uid   = int(rkey.split(':', 1)[1])
+                    raw   = _kv_get(rkey)
                     if raw:
                         self._d[uid] = json.loads(raw)
                 except Exception:
                     pass
-            log.info('Loaded %d %s entries from Redis', len(self._d), self._prefix)
+            log.info('Loaded %d %s entries from KV', len(self._d), self._prefix)
         except Exception as e:
-            log.warning('Redis load [%s]: %s', self._prefix, e)
+            log.warning('KV load [%s]: %s', self._prefix, e)
 
 
 # ── State ─────────────────────────────────────────────────────
@@ -1233,7 +1318,8 @@ def gas_callback():
 
 @app.route('/health')
 def health():
-    return jsonify(status='ok', states=len(_STATE), redis=bool(_redis))
+    backend = 'redis-py' if _redis else ('upstash-rest' if _upstash else 'memory')
+    return jsonify(status='ok', states=len(_STATE), kv_backend=backend)
 
 
 @app.route('/set_webhook')
