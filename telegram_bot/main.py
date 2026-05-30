@@ -69,6 +69,27 @@ IMAGE_SOURCES = [
 ]
 IMAGE_SOURCE_MAP = {code: label for code, label in IMAGE_SOURCES}
 
+TEMPLATES = [
+    ('Gold Classic',    'Gold Classic ✨'),
+    ('Dark Mystery',    'Dark Mystery 🌑'),
+    ('Celestial Blue',  'Celestial Blue 💙'),
+    ('Rose Gold',       'Rose Gold 🌸'),
+    ('Crimson Power',   'Crimson Power 🔴'),
+    ('Snow White',      'Snow White ⬜'),
+    ('Slate Pro',       'Slate Pro 🩶'),
+    ('Emerald Elite',   'Emerald Elite 💚'),
+]
+TEMPLATE_MAP = {code: label for code, label in TEMPLATES}
+
+MUSIC_VIBES = [
+    ('ambient meditation spiritual',      'Медитация 🔮'),
+    ('ambient spiritual uplifting',       'Подъём ⚡'),
+    ('ambient spiritual relaxing',        'Релакс 🌊'),
+    ('ambient spiritual epic',            'Эпик 🎺'),
+    ('none',                              'Без музыки 🔇'),
+]
+MUSIC_VIBE_MAP = {code: label for code, label in MUSIC_VIBES}
+
 # ── Telegram helpers ──────────────────────────────────────────
 
 def _tg(method, payload, files=None):
@@ -163,6 +184,26 @@ def _source_kb():
         row = []
         for code, lbl in IMAGE_SOURCES[i:i+2]:
             row.append({'text': lbl, 'callback_data': f'source:{code}'})
+        rows.append(row)
+    return {'inline_keyboard': rows}
+
+
+def _template_kb():
+    rows = []
+    for i in range(0, len(TEMPLATES), 2):
+        row = []
+        for code, lbl in TEMPLATES[i:i+2]:
+            row.append({'text': lbl, 'callback_data': f'tmpl:{code}'})
+        rows.append(row)
+    return {'inline_keyboard': rows}
+
+
+def _music_kb():
+    rows = []
+    for i in range(0, len(MUSIC_VIBES), 2):
+        row = []
+        for code, lbl in MUSIC_VIBES[i:i+2]:
+            row.append({'text': lbl, 'callback_data': f'music:{code}'})
         rows.append(row)
     return {'inline_keyboard': rows}
 
@@ -337,20 +378,65 @@ def _handle_callback(cq):
 
     # ── Image source selected ──────────────────────────────────
     elif data.startswith('source:'):
-        source    = data.split(':', 1)[1]
+        source = data.split(':', 1)[1]
+        idea   = state.get('idea', '')
+        _STATE[user_id] = {**state, 'step': 'template_shown', 'image_source': source}
+        edit_msg(chat_id, msg_id,
+                 f'✅ <b>Тема:</b> {idea}\n'
+                 f'<b>Тип:</b> {POST_TYPE_MAP.get(state.get("post_type",""), "")}\n'
+                 f'<b>Тон:</b> {TONE_MAP.get(state.get("tone",""), "")}\n'
+                 f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n\n'
+                 f'<b>Шаблон оформления:</b>',
+                 reply_markup=_template_kb())
+
+    # ── Template selected ──────────────────────────────────────
+    elif data.startswith('tmpl:'):
+        template  = data.split(':', 1)[1]
         idea      = state.get('idea', '')
         post_type = state.get('post_type', 'carousel')
         tone      = state.get('tone', 'mystical, premium, clear, emotionally engaging')
-        _STATE[user_id] = {**state, 'step': 'generating_content', 'image_source': source}
+        source    = state.get('image_source', 'Pexels')
+        _STATE[user_id] = {**state, 'step': 'music_shown' if post_type == 'reel' else 'generating_content',
+                           'template': template}
+
+        if post_type == 'reel':
+            edit_msg(chat_id, msg_id,
+                     f'✅ <b>Тема:</b> {idea}\n'
+                     f'<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n'
+                     f'<b>Тон:</b> {TONE_MAP.get(tone, tone)}\n'
+                     f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n'
+                     f'<b>Шаблон:</b> {TEMPLATE_MAP.get(template, template)}\n\n'
+                     f'<b>Фоновая музыка:</b>',
+                     reply_markup=_music_kb())
+        else:
+            edit_msg(chat_id, msg_id,
+                     f'✅ <b>Тема:</b> {idea}\n'
+                     f'<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n'
+                     f'<b>Тон:</b> {TONE_MAP.get(tone, tone)}\n'
+                     f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n'
+                     f'<b>Шаблон:</b> {TEMPLATE_MAP.get(template, template)}\n\n'
+                     f'⏳ <i>Генерирую контент…</i>')
+            _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template)
+
+    # ── Music vibe selected (reels only) ──────────────────────
+    elif data.startswith('music:'):
+        music_vibe = data.split(':', 1)[1]
+        idea       = state.get('idea', '')
+        post_type  = state.get('post_type', 'reel')
+        tone       = state.get('tone', 'mystical, premium, clear, emotionally engaging')
+        source     = state.get('image_source', 'Pexels')
+        template   = state.get('template', 'Gold Classic')
+        _STATE[user_id] = {**state, 'step': 'generating_content', 'music_vibe': music_vibe}
 
         edit_msg(chat_id, msg_id,
                  f'✅ <b>Тема:</b> {idea}\n'
                  f'<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n'
                  f'<b>Тон:</b> {TONE_MAP.get(tone, tone)}\n'
-                 f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n\n'
+                 f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n'
+                 f'<b>Шаблон:</b> {TEMPLATE_MAP.get(template, template)}\n'
+                 f'<b>Музыка:</b> {MUSIC_VIBE_MAP.get(music_vibe, music_vibe)}\n\n'
                  f'⏳ <i>Генерирую контент…</i>')
-
-        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source)
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
 
     # ── Confirm → generate images ──────────────────────────────
     elif data.startswith('confirm:'):
@@ -365,33 +451,35 @@ def _handle_callback(cq):
 
     # ── Regen content ──────────────────────────────────────────
     elif data.startswith('regen_content:'):
-        idea      = state.get('idea', '')
-        post_type = state.get('post_type', 'carousel')
-        tone      = state.get('tone', 'mystical, premium, clear, emotionally engaging')
-        source    = state.get('image_source', 'Pexels')
+        idea       = state.get('idea', '')
+        post_type  = state.get('post_type', 'carousel')
+        tone       = state.get('tone', 'mystical, premium, clear, emotionally engaging')
+        source     = state.get('image_source', 'Pexels')
+        template   = state.get('template', 'Gold Classic')
+        music_vibe = state.get('music_vibe', '')
         if not idea:
             send(chat_id, '❌ Потеряна идея. Начни заново.')
             return
         _STATE[user_id] = {**state, 'step': 'generating_content'}
         edit_msg(chat_id, msg_id,
-                 f'🔄 <b>Регенерирую контент…</b>\n'
-                 f'<b>Тема:</b> {idea}\n\n<i>Подожди немного.</i>')
-        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source)
+                 f'🔄 <b>Регенерирую контент…</b>\n<b>Тема:</b> {idea}\n\n<i>Подожди немного.</i>')
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
 
     # ── Regen (full) ───────────────────────────────────────────
     elif data.startswith('regen:'):
-        idea      = state.get('idea', '')
-        post_type = state.get('post_type', 'carousel')
-        tone      = state.get('tone', 'mystical, premium, clear, emotionally engaging')
-        source    = state.get('image_source', 'Pexels')
+        idea       = state.get('idea', '')
+        post_type  = state.get('post_type', 'carousel')
+        tone       = state.get('tone', 'mystical, premium, clear, emotionally engaging')
+        source     = state.get('image_source', 'Pexels')
+        template   = state.get('template', 'Gold Classic')
+        music_vibe = state.get('music_vibe', '')
         if not idea:
             send(chat_id, '❌ Потеряна идея. Начни заново.')
             return
         _STATE[user_id] = {**state, 'step': 'generating_content'}
         edit_msg(chat_id, msg_id,
-                 f'🔄 <b>Регенерирую с нуля…</b>\n<b>Тема:</b> {idea}\n\n'
-                 f'<i>Подожди 3–5 минут.</i>')
-        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source)
+                 f'🔄 <b>Регенерирую с нуля…</b>\n<b>Тема:</b> {idea}\n\n<i>Подожди 3–5 минут.</i>')
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
 
     # ── Approve ────────────────────────────────────────────────
     elif data.startswith('approve:'):
@@ -411,7 +499,8 @@ def _handle_callback(cq):
 
 # ── GAS communication ─────────────────────────────────────────
 
-def _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, image_source):
+def _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone,
+                         image_source, template='Gold Classic', music_vibe=''):
     """Step ① only — generate content text, then wait for user confirmation."""
     if not GAS_WEBAPP_URL:
         send(chat_id, '❌ GAS_WEBAPP_URL не настроен.')
@@ -423,6 +512,8 @@ def _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, imag
             'postType':    post_type,
             'tone':        tone,
             'imageSource': image_source,
+            'template':    template,
+            'musicVibe':   music_vibe,
             'chatId':      chat_id,
             'userId':      user_id,
             'username':    username,
@@ -479,13 +570,19 @@ def _send_content_preview(chat_id, body, row_id):
         else:
             slides_fmt += f'\n{i+1}. {s}'
 
-    msg = (
+    # Send hook + slides as one message, full caption as a second message
+    # (Telegram has a 4096-char limit per message)
+    msg1 = (
         f'✅ <b>Контент готов!</b> ({type_lbl})\n\n'
         f'🎣 <b>Hook:</b>\n{hook}\n\n'
-        f'📋 <b>Слайды:</b>{slides_fmt}\n\n'
-        f'📝 <b>Подпись (первые 300 символов):</b>\n{caption[:300]}…'
+        f'📋 <b>Слайды:</b>{slides_fmt}'
     )
-    send(chat_id, msg, reply_markup=_confirm_kb(row_id))
+    send(chat_id, msg1[:4090])
+
+    # Full caption in a separate message so nothing is truncated
+    hashtags = body.get('hashtags', '')
+    caption_msg = f'📝 <b>Подпись:</b>\n{caption}\n\n🏷 <b>Хэштеги:</b>\n{hashtags}'
+    send(chat_id, caption_msg[:4090], reply_markup=_confirm_kb(row_id))
 
 
 @app.route('/gas_callback', methods=['POST'])
