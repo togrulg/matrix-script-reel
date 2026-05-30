@@ -331,7 +331,7 @@ def _handle_message(msg):
              '• /help — эта справка')
         return
 
-    if text == '/cancel':
+    if text in ('/cancel', '/reset'):
         _STATE.pop(user_id, None)
         send(chat_id, '❌ Отменено. Напиши новую идею когда будешь готов.')
         return
@@ -839,7 +839,9 @@ def gas_callback():
 
     elif event == 'error':
         msg = body.get('message', 'Неизвестная ошибка')
-        send(chat_id, f'❌ <b>Ошибка:</b>\n<code>{msg}</code>')
+        send(chat_id, f'❌ <b>Ошибка:</b>\n<code>{msg}</code>\n\nНапиши новую идею чтобы начать заново.')
+        if user_id and user_id in _STATE:
+            _STATE[user_id]['step'] = 'idle'
 
     return jsonify(ok=True)
 
