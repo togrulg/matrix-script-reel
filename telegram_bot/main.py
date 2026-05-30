@@ -243,8 +243,39 @@ def _confirm_kb(row_id):
         {'text': '✅ Генерировать изображения', 'callback_data': f'confirm:{row_id}'},
         {'text': '🔄 Перегенерировать текст',  'callback_data': f'regen_content:{row_id}'},
     ], [
-        {'text': '✏️ Новая идея', 'callback_data': 'newidea:0'},
+        {'text': '✏️ Редактировать',  'callback_data': f'edit:{row_id}'},
+        {'text': '✏️ Новая идея',     'callback_data': 'newidea:0'},
     ]]}
+
+
+def _edit_field_kb(row_id, post_type=''):
+    rows = [
+        [{'text': '🎣 Hook',      'callback_data': f'editfield:{row_id}:hook'},
+         {'text': '📋 Слайды',   'callback_data': f'editfield:{row_id}:slides'}],
+        [{'text': '📝 Подпись',  'callback_data': f'editfield:{row_id}:caption'},
+         {'text': '🏷 Хэштеги', 'callback_data': f'editfield:{row_id}:hashtags'}],
+        [{'text': '« Назад',     'callback_data': f'editback:{row_id}'}],
+    ]
+    # Story has no caption/hashtags
+    if post_type == 'story':
+        rows = [rows[0], rows[-1]]
+    return {'inline_keyboard': rows}
+
+
+EDIT_FIELD_LABELS = {
+    'hook'     : '🎣 Hook',
+    'slides'   : '📋 Слайды',
+    'caption'  : '📝 Подпись',
+    'hashtags' : '🏷 Хэштеги',
+}
+EDIT_FIELD_HINTS = {
+    'hook'    : 'Отправь новый <b>hook</b> (первая фраза, цепляющая внимание):',
+    'slides'  : ('Отправь новые <b>слайды</b>.\n'
+                 'Формат каждого слайда: <code>ЗАГОЛОВОК|подзаголовок</code>\n'
+                 'Слайды разделяй строкой <code>---</code>'),
+    'caption' : 'Отправь новую <b>подпись</b> (caption) для поста:',
+    'hashtags': 'Отправь новые <b>хэштеги</b> (через пробел или с новой строки):',
+}
 
 
 def _regen_menu_kb(row_id):
@@ -373,6 +404,30 @@ def _handle_message(msg):
         return
 
     if text.startswith('/'):
+        return
+
+    # ── Awaiting field edit ───────────────────────────────────
+    current_step = _STATE.get(user_id, {}).get('step', 'idle')
+    if current_step == 'awaiting_edit':
+        state     = _STATE.get(user_id, {})
+        row_id    = state.get('row_id', '')
+        field     = state.get('edit_field', '')
+        post_type = state.get('post_type', '')
+        if not row_id or not field:
+            _STATE[user_id]['step'] = 'awaiting_confirm'
+            send(chat_id, '❌ Потеряна ссылка на контент. Начни заново.')
+            return
+        # Normalise slides input: user may use "---" as separator
+        new_value = text.strip()
+        if field == 'slides':
+            # Normalise: accept bare "---" lines as separator
+            new_value = '\n---\n'.join(
+                p.strip() for p in new_value.replace('\n---\n', '|||').replace('---', '|||').split('|||')
+                if p.strip()
+            )
+        _STATE[user_id]['step'] = 'awaiting_confirm'
+        send(chat_id, '⏳ <i>Сохраняю правки…</i>')
+        _send_field_update(chat_id, user_id, row_id, field, new_value, post_type)
         return
 
     # ── Block new idea if generation is already in progress ───
@@ -569,6 +624,37 @@ def _handle_callback(cq):
                  '\n\n⏳ <i>Генерирую изображения и оформление…\nОбычно 3–5 минут.</i>')
         _send_to_gas_media(chat_id, user_id, username, row_id, post_type)
 
+    # ── Edit content ───────────────────────────────────────────
+    elif data.startswith('edit:'):
+        row_id    = data.split(':', 1)[1]
+        post_type = state.get('post_type', '')
+        _STATE[user_id] = {**state, 'row_id': row_id}
+        edit_msg(chat_id, msg_id,
+                 cq['message'].get('text', '') + '\n\n<b>Что хочешь изменить?</b>',
+                 reply_markup=_edit_field_kb(row_id, post_type))
+
+    elif data.startswith('editback:'):
+        row_id = data.split(':', 1)[1]
+        edit_msg(chat_id, msg_id,
+                 cq['message'].get('text', '').split('\n\n<b>Что хочешь изменить?</b>')[0],
+                 reply_markup=_confirm_kb(row_id))
+
+    elif data.startswith('editfield:'):
+        parts = data.split(':', 2)
+        row_id = parts[1] if len(parts) > 1 else ''
+        field  = parts[2] if len(parts) > 2 else ''
+        _STATE[user_id] = {
+            **state,
+            'step'       : 'awaiting_edit',
+            'row_id'     : row_id,
+            'edit_field' : field,
+            'edit_msg_id': msg_id,
+        }
+        hint = EDIT_FIELD_HINTS.get(field, 'Отправь новое значение:')
+        edit_msg(chat_id, msg_id,
+                 cq['message'].get('text', '').split('\n\n<b>Что хочешь изменить?</b>')[0] +
+                 f'\n\n{hint}')
+
     # ── Regen content ──────────────────────────────────────────
     elif data.startswith('regen_content:'):
         idea       = state.get('idea', '')
@@ -751,6 +837,40 @@ def _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone,
         log.exception('GAS content request failed')
         send(chat_id, f'❌ Ошибка запуска генерации:\n<code>{e}</code>')
         _STATE.get(user_id, {}).update(step='idle')
+
+
+def _send_field_update(chat_id, user_id, row_id, field, new_value, post_type):
+    """Send an edited field value to GAS, then re-display the content preview."""
+    if not GAS_WEBAPP_URL:
+        send(chat_id, '❌ GAS_WEBAPP_URL не настроен.')
+        return
+    try:
+        resp = requests.post(GAS_WEBAPP_URL, json={
+            'action'   : 'update_content',
+            'rowId'    : row_id,
+            'field'    : field,
+            'value'    : new_value,
+            'postType' : post_type,
+            'chatId'   : chat_id,
+            'userId'   : user_id,
+            'secret'   : GAS_SECRET,
+        }, timeout=30)
+        data = resp.json()
+        if data.get('status') == 'ok':
+            # GAS returns updated content — re-show preview
+            body = data.get('content', {})
+            body['postType'] = post_type
+            if not body.get('rowId'):
+                body['rowId'] = row_id
+            send(chat_id, f'✅ <b>{EDIT_FIELD_LABELS.get(field, field)}</b> обновлён.')
+            _send_content_preview(chat_id, body, row_id)
+        else:
+            raise Exception(data.get('error') or resp.text[:200])
+    except Exception as e:
+        log.exception('GAS field update failed')
+        send(chat_id, f'❌ Не удалось сохранить правки:\n<code>{e}</code>')
+        if user_id in _STATE:
+            _STATE[user_id]['step'] = 'awaiting_confirm'
 
 
 def _send_to_gas_media(chat_id, user_id, username, row_id, post_type):
