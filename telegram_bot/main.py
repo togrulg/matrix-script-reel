@@ -1,38 +1,47 @@
 """
 Matrix Script Telegram Bot
-Webhook-based bot that lets users generate Instagram content via GAS pipeline.
+Webhook-based Instagram content pipeline controller.
 
-Flow:
-  1. User sends idea → AI expands to 5 topics
-  2. User picks topic + post type
-  3. Bot sends order to GAS Web App
-  4. GAS runs pipeline and calls back via POST /gas_callback
-  5. Bot shows content preview with Approve / Regenerate / Edit buttons
+Full conversation flow:
+  idea → 5 topics → post type → tone → image source
+  → GAS step① (content only) → preview + confirm
+  → GAS step②③④ (images + overlay + reel)
+  → review (Approve / Regen / New idea)
+
+Bot commands:
+  /start   — welcome + reset
+  /cancel  — abort current flow
+  /help    — show all commands
+  /last    — show last generated content again
+  /status  — check active pipeline state
 """
 import os
 import json
 import logging
+import threading
 import requests
 from flask import Flask, request, jsonify
 from ai import expand_topics
 
 # ── Config ────────────────────────────────────────────────────
-BOT_TOKEN     = os.environ.get('BOT_TOKEN', '')
-GAS_WEBAPP_URL = os.environ.get('GAS_WEBAPP_URL', '')   # deployed GAS Web App URL
-GAS_SECRET    = os.environ.get('GAS_SECRET', '')        # shared secret for request auth
-WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')   # optional Telegram webhook secret token
-
-TELEGRAM_API = f'https://api.telegram.org/bot{BOT_TOKEN}'
+BOT_TOKEN      = os.environ.get('BOT_TOKEN', '')
+GAS_WEBAPP_URL = os.environ.get('GAS_WEBAPP_URL', '')
+GAS_SECRET     = os.environ.get('GAS_SECRET', '')
+WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')
+TELEGRAM_API   = f'https://api.telegram.org/bot{BOT_TOKEN}'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Per-user conversation state ───────────────────────────────
-# { user_id: { step, topics, idea, chat_id, original_idea } }
+# ── State ─────────────────────────────────────────────────────
+# { user_id: { step, topics, idea, post_type, tone, image_source,
+#              chat_id, username, row_id, last_content } }
 _STATE: dict = {}
+_LAST:  dict = {}   # { user_id: last content_ready payload }
 
+# ── Constants ─────────────────────────────────────────────────
 POST_TYPES = [
     ('reel',       'Рилс 🎬'),
     ('carousel',   'Карусель 🖼️'),
@@ -41,9 +50,30 @@ POST_TYPES = [
 ]
 POST_TYPE_MAP = dict(POST_TYPES)
 
+TONES = [
+    ('mystical, premium, clear, emotionally engaging', 'Мистик ✨'),
+    ('bright, optimistic, uplifting, sunny, joyful',   'Позитив ☀️'),
+    ('warm, friendly, motivational',                   'Тепло 🌸'),
+    ('bold, direct, no-nonsense',                      'Дерзко 🔥'),
+    ('poetic, dreamy, lyrical',                        'Поэзия 🌙'),
+    ('light and airy, soft, pastel, fresh, feminine',  'Нежность 🕊️'),
+]
+TONE_MAP = {code: label for code, label in TONES}
+
+IMAGE_SOURCES = [
+    ('Pexels',       'Pexels 📸'),
+    ('Pollinations', 'Pollinations 🤖'),
+    ('Unsplash',     'Unsplash 🌿'),
+    ('HuggingFace',  'HuggingFace 🧠'),
+    ('Pixabay',      'Pixabay 🎨'),
+]
+IMAGE_SOURCE_MAP = {code: label for code, label in IMAGE_SOURCES}
+
 # ── Telegram helpers ──────────────────────────────────────────
 
-def _tg(method: str, payload: dict, files=None) -> dict:
+def _tg(method, payload, files=None):
+    if not BOT_TOKEN:
+        return {}
     url = f'{TELEGRAM_API}/{method}'
     try:
         if files:
@@ -52,11 +82,11 @@ def _tg(method: str, payload: dict, files=None) -> dict:
             r = requests.post(url, json=payload, timeout=15)
         return r.json()
     except Exception as e:
-        log.error('Telegram API error [%s]: %s', method, e)
+        log.error('Telegram [%s]: %s', method, e)
         return {}
 
 
-def send(chat_id, text, reply_markup=None, parse_mode='HTML') -> dict:
+def send(chat_id, text, reply_markup=None, parse_mode='HTML'):
     p = {'chat_id': chat_id, 'text': text, 'parse_mode': parse_mode}
     if reply_markup:
         p['reply_markup'] = json.dumps(reply_markup)
@@ -72,20 +102,14 @@ def edit_msg(chat_id, message_id, text, reply_markup=None, parse_mode='HTML'):
 
 
 def send_photo(chat_id, photo_url, caption='', reply_markup=None):
-    p = {'chat_id': chat_id, 'photo': photo_url, 'caption': caption, 'parse_mode': 'HTML'}
+    p = {'chat_id': chat_id, 'photo': photo_url,
+         'caption': caption, 'parse_mode': 'HTML'}
     if reply_markup:
         p['reply_markup'] = json.dumps(reply_markup)
     return _tg('sendPhoto', p)
 
 
-def send_video_bytes(chat_id, video_bytes: bytes, caption='', reply_markup=None):
-    p = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'}
-    if reply_markup:
-        p['reply_markup'] = json.dumps(reply_markup)
-    return _tg('sendVideo', p, files={'video': ('reel.mp4', video_bytes, 'video/mp4')})
-
-
-def send_media_group(chat_id, photo_urls: list, caption=''):
+def send_media_group(chat_id, photo_urls, caption=''):
     media = []
     for i, url in enumerate(photo_urls):
         item = {'type': 'photo', 'media': url}
@@ -96,45 +120,74 @@ def send_media_group(chat_id, photo_urls: list, caption=''):
     return _tg('sendMediaGroup', {'chat_id': chat_id, 'media': json.dumps(media)})
 
 
+def send_video_bytes(chat_id, video_bytes, caption='', reply_markup=None):
+    p = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'}
+    if reply_markup:
+        p['reply_markup'] = json.dumps(reply_markup)
+    return _tg('sendVideo', p, files={'video': ('reel.mp4', video_bytes, 'video/mp4')})
+
+
 def answer_cb(callback_id, text=''):
     _tg('answerCallbackQuery', {'callback_query_id': callback_id, 'text': text})
 
 
 # ── Keyboards ─────────────────────────────────────────────────
 
-def _topics_kb(topics: list) -> dict:
-    return {
-        'inline_keyboard': [
-            [{'text': f'{i+1}. {t[:80]}', 'callback_data': f'topic:{i}'}]
-            for i, t in enumerate(topics)
-        ]
-    }
+def _topics_kb(topics):
+    return {'inline_keyboard': [
+        [{'text': f'{i+1}. {t[:80]}', 'callback_data': f'topic:{i}'}]
+        for i, t in enumerate(topics)
+    ]}
 
 
-def _type_kb() -> dict:
-    return {
-        'inline_keyboard': [
-            [{'text': label, 'callback_data': f'type:{code}'} for code, label in POST_TYPES[:2]],
-            [{'text': label, 'callback_data': f'type:{code}'} for code, label in POST_TYPES[2:]],
-        ]
-    }
+def _type_kb():
+    return {'inline_keyboard': [
+        [{'text': lbl, 'callback_data': f'type:{code}'} for code, lbl in POST_TYPES[:2]],
+        [{'text': lbl, 'callback_data': f'type:{code}'} for code, lbl in POST_TYPES[2:]],
+    ]}
 
 
-def _review_kb(row_id: str) -> dict:
-    return {
-        'inline_keyboard': [[
-            {'text': '✅ Одобрить',       'callback_data': f'approve:{row_id}'},
-            {'text': '🔄 Регенерировать', 'callback_data': f'regen:{row_id}'},
-            {'text': '✏️ Новая идея',     'callback_data': f'newidea:{row_id}'},
-        ]]
-    }
+def _tone_kb():
+    rows = []
+    for i in range(0, len(TONES), 2):
+        row = []
+        for code, lbl in TONES[i:i+2]:
+            row.append({'text': lbl, 'callback_data': f'tone:{code}'})
+        rows.append(row)
+    return {'inline_keyboard': rows}
 
 
-# ── Webhook handler ───────────────────────────────────────────
+def _source_kb():
+    rows = []
+    for i in range(0, len(IMAGE_SOURCES), 2):
+        row = []
+        for code, lbl in IMAGE_SOURCES[i:i+2]:
+            row.append({'text': lbl, 'callback_data': f'source:{code}'})
+        rows.append(row)
+    return {'inline_keyboard': rows}
+
+
+def _confirm_kb(row_id):
+    return {'inline_keyboard': [[
+        {'text': '✅ Генерировать изображения', 'callback_data': f'confirm:{row_id}'},
+        {'text': '🔄 Перегенерировать текст',  'callback_data': f'regen_content:{row_id}'},
+    ], [
+        {'text': '✏️ Новая идея', 'callback_data': 'newidea:0'},
+    ]]}
+
+
+def _review_kb(row_id):
+    return {'inline_keyboard': [[
+        {'text': '✅ Одобрить',       'callback_data': f'approve:{row_id}'},
+        {'text': '🔄 Регенерировать', 'callback_data': f'regen:{row_id}'},
+        {'text': '✏️ Новая идея',     'callback_data': 'newidea:0'},
+    ]]}
+
+
+# ── Webhook ───────────────────────────────────────────────────
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # Optional webhook secret validation
     if WEBHOOK_SECRET:
         token = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
         if token != WEBHOOK_SECRET:
@@ -142,19 +195,15 @@ def webhook():
 
     update = request.get_json(force=True, silent=True) or {}
 
-    # ── Callback query (inline button press) ──────────────────
     if 'callback_query' in update:
         _handle_callback(update['callback_query'])
-        return jsonify(ok=True)
-
-    # ── Regular message ────────────────────────────────────────
-    if 'message' in update:
+    elif 'message' in update:
         _handle_message(update['message'])
 
     return jsonify(ok=True)
 
 
-def _handle_message(msg: dict):
+def _handle_message(msg):
     user_id  = msg['from']['id']
     chat_id  = msg['chat']['id']
     text     = (msg.get('text') or '').strip()
@@ -163,44 +212,83 @@ def _handle_message(msg: dict):
     if not text:
         return
 
+    # ── Commands ──────────────────────────────────────────────
     if text == '/start':
         _STATE.pop(user_id, None)
         send(chat_id,
              '👋 <b>Matrix Script Bot</b>\n\n'
-             'Напиши идею для поста — я предложу 5 тем на выбор, '
-             'ты выберешь нужную и бот сгенерирует готовый контент.\n\n'
-             '<i>Пример: «хочу про деньги и матрицу судьбы»</i>')
+             'Напиши идею для поста — я предложу 5 тем, ты выберешь нужную '
+             'и бот сгенерирует готовый контент.\n\n'
+             '<i>Пример: «хочу про деньги и матрицу судьбы»</i>\n\n'
+             'Команды: /help /cancel /last /status')
+        return
+
+    if text == '/help':
+        send(chat_id,
+             '📋 <b>Команды бота:</b>\n\n'
+             '• Напиши любую идею — старт нового поста\n'
+             '• /cancel — отменить текущую генерацию\n'
+             '• /last — показать последний сгенерированный контент\n'
+             '• /status — статус текущей операции\n'
+             '• /start — сбросить и начать заново\n'
+             '• /help — эта справка')
+        return
+
+    if text == '/cancel':
+        _STATE.pop(user_id, None)
+        send(chat_id, '❌ Отменено. Напиши новую идею когда будешь готов.')
+        return
+
+    if text == '/last':
+        last = _LAST.get(user_id)
+        if not last:
+            send(chat_id, 'Нет сохранённого контента. Начни с новой идеи.')
+        else:
+            _send_content_preview(chat_id, last, last.get('rowId', '?'))
+        return
+
+    if text == '/status':
+        state = _STATE.get(user_id, {})
+        step  = state.get('step', 'idle')
+        if step == 'idle' or not state:
+            send(chat_id, '💤 Нет активных операций. Напиши идею чтобы начать.')
+        else:
+            idea = state.get('idea', '—')
+            pt   = POST_TYPE_MAP.get(state.get('post_type', ''), '—')
+            send(chat_id, f'⚙️ <b>Статус:</b> {step}\n<b>Тема:</b> {idea}\n<b>Тип:</b> {pt}')
         return
 
     if text.startswith('/'):
         return
 
-    # Any non-command text → treat as new idea
+    # ── New idea ──────────────────────────────────────────────
     _STATE[user_id] = {'step': 'idle', 'chat_id': chat_id, 'username': username}
-
     thinking = send(chat_id, '🤔 <i>Анализирую идею и генерирую темы…</i>')
     thinking_id = (thinking.get('result') or {}).get('message_id')
 
-    try:
-        topics = expand_topics(text)
-    except Exception as e:
-        log.exception('expand_topics failed')
-        send(chat_id, f'❌ Не удалось сгенерировать темы:\n<code>{e}</code>')
-        return
+    def _run():
+        try:
+            topics = expand_topics(text)
+        except Exception as e:
+            log.exception('expand_topics failed')
+            send(chat_id, f'❌ Не удалось сгенерировать темы:\n<code>{e}</code>')
+            return
 
-    _STATE[user_id].update(step='topics_shown', topics=topics, original_idea=text)
+        _STATE[user_id].update(step='topics_shown', topics=topics, original_idea=text)
+        body = (
+            '💡 <b>Вот 5 тем по твоей идее:</b>\n\n'
+            + '\n'.join(f'{i+1}. {t}' for i, t in enumerate(topics))
+            + '\n\n<i>Выбери одну:</i>'
+        )
+        if thinking_id:
+            edit_msg(chat_id, thinking_id, body, reply_markup=_topics_kb(topics))
+        else:
+            send(chat_id, body, reply_markup=_topics_kb(topics))
 
-    topics_text = '\n'.join(f'{i+1}. {t}' for i, t in enumerate(topics))
-    body = (f'💡 <b>Вот 5 тем по твоей идее:</b>\n\n{topics_text}\n\n'
-            f'<i>Выбери одну — и скажу, какой тип поста сделать:</i>')
-
-    if thinking_id:
-        edit_msg(chat_id, thinking_id, body, reply_markup=_topics_kb(topics))
-    else:
-        send(chat_id, body, reply_markup=_topics_kb(topics))
+    threading.Thread(target=_run, daemon=True).start()
 
 
-def _handle_callback(cq: dict):
+def _handle_callback(cq):
     user_id  = cq['from']['id']
     chat_id  = cq['message']['chat']['id']
     msg_id   = cq['message']['message_id']
@@ -219,7 +307,7 @@ def _handle_callback(cq: dict):
         chosen = topics[idx]
         _STATE[user_id] = {**state, 'step': 'type_shown', 'idea': chosen}
         edit_msg(chat_id, msg_id,
-                 f'✅ <b>Выбрана тема:</b>\n{chosen}\n\n<b>Выбери тип поста:</b>',
+                 f'✅ <b>Тема:</b> {chosen}\n\n<b>Тип поста:</b>',
                  reply_markup=_type_kb())
 
     # ── Post type selected ─────────────────────────────────────
@@ -227,19 +315,83 @@ def _handle_callback(cq: dict):
         post_type = data.split(':', 1)[1]
         idea      = state.get('idea', '')
         if not idea:
-            send(chat_id, '❌ Что-то пошло не так. Начни заново — отправь идею.')
+            send(chat_id, '❌ Потеряна идея. Начни заново.')
             return
+        _STATE[user_id] = {**state, 'step': 'tone_shown', 'post_type': post_type}
+        edit_msg(chat_id, msg_id,
+                 f'✅ <b>Тема:</b> {idea}\n<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n\n'
+                 f'<b>Тон и стиль:</b>',
+                 reply_markup=_tone_kb())
 
-        type_label = POST_TYPE_MAP.get(post_type, post_type)
-        _STATE[user_id] = {**state, 'step': 'generating', 'post_type': post_type}
+    # ── Tone selected ──────────────────────────────────────────
+    elif data.startswith('tone:'):
+        tone = data.split(':', 1)[1]
+        idea = state.get('idea', '')
+        _STATE[user_id] = {**state, 'step': 'source_shown', 'tone': tone}
+        edit_msg(chat_id, msg_id,
+                 f'✅ <b>Тема:</b> {idea}\n'
+                 f'<b>Тип:</b> {POST_TYPE_MAP.get(state.get("post_type",""), "")}\n'
+                 f'<b>Тон:</b> {TONE_MAP.get(tone, tone)}\n\n'
+                 f'<b>Источник изображений:</b>',
+                 reply_markup=_source_kb())
+
+    # ── Image source selected ──────────────────────────────────
+    elif data.startswith('source:'):
+        source    = data.split(':', 1)[1]
+        idea      = state.get('idea', '')
+        post_type = state.get('post_type', 'carousel')
+        tone      = state.get('tone', 'mystical, premium, clear, emotionally engaging')
+        _STATE[user_id] = {**state, 'step': 'generating_content', 'image_source': source}
 
         edit_msg(chat_id, msg_id,
                  f'✅ <b>Тема:</b> {idea}\n'
-                 f'<b>Тип:</b> {type_label}\n\n'
-                 f'⏳ <i>Отправляю в генерацию…\n'
-                 f'Обычно 3–5 минут. Пришлю, как будет готово.</i>')
+                 f'<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n'
+                 f'<b>Тон:</b> {TONE_MAP.get(tone, tone)}\n'
+                 f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n\n'
+                 f'⏳ <i>Генерирую контент…</i>')
 
-        _send_to_gas(chat_id, user_id, username, idea, post_type)
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source)
+
+    # ── Confirm → generate images ──────────────────────────────
+    elif data.startswith('confirm:'):
+        row_id    = data.split(':', 1)[1]
+        idea      = state.get('idea', '—')
+        post_type = state.get('post_type', 'carousel')
+        _STATE[user_id] = {**state, 'step': 'generating_media'}
+        edit_msg(chat_id, msg_id,
+                 cq['message'].get('text', '') +
+                 '\n\n⏳ <i>Генерирую изображения и оформление…\nОбычно 3–5 минут.</i>')
+        _send_to_gas_media(chat_id, user_id, username, row_id, post_type)
+
+    # ── Regen content ──────────────────────────────────────────
+    elif data.startswith('regen_content:'):
+        idea      = state.get('idea', '')
+        post_type = state.get('post_type', 'carousel')
+        tone      = state.get('tone', 'mystical, premium, clear, emotionally engaging')
+        source    = state.get('image_source', 'Pexels')
+        if not idea:
+            send(chat_id, '❌ Потеряна идея. Начни заново.')
+            return
+        _STATE[user_id] = {**state, 'step': 'generating_content'}
+        edit_msg(chat_id, msg_id,
+                 f'🔄 <b>Регенерирую контент…</b>\n'
+                 f'<b>Тема:</b> {idea}\n\n<i>Подожди немного.</i>')
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source)
+
+    # ── Regen (full) ───────────────────────────────────────────
+    elif data.startswith('regen:'):
+        idea      = state.get('idea', '')
+        post_type = state.get('post_type', 'carousel')
+        tone      = state.get('tone', 'mystical, premium, clear, emotionally engaging')
+        source    = state.get('image_source', 'Pexels')
+        if not idea:
+            send(chat_id, '❌ Потеряна идея. Начни заново.')
+            return
+        _STATE[user_id] = {**state, 'step': 'generating_content'}
+        edit_msg(chat_id, msg_id,
+                 f'🔄 <b>Регенерирую с нуля…</b>\n<b>Тема:</b> {idea}\n\n'
+                 f'<i>Подожди 3–5 минут.</i>')
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source)
 
     # ── Approve ────────────────────────────────────────────────
     elif data.startswith('approve:'):
@@ -247,38 +399,53 @@ def _handle_callback(cq: dict):
                  cq['message'].get('text', '') + '\n\n✅ <b>Одобрено!</b>',
                  reply_markup=None)
         send(chat_id, '👍 Контент одобрен. Напиши новую идею когда будешь готов.')
-
-    # ── Regenerate ─────────────────────────────────────────────
-    elif data.startswith('regen:'):
-        idea      = state.get('idea', '')
-        post_type = state.get('post_type', 'carousel')
-        if not idea:
-            send(chat_id, '❌ Не могу регенерировать — потеряна идея. Отправь заново.')
-            return
-        type_label = POST_TYPE_MAP.get(post_type, post_type)
-        edit_msg(chat_id, msg_id,
-                 f'🔄 <b>Регенерирую…</b>\n'
-                 f'<b>Тема:</b> {idea}\n<b>Тип:</b> {type_label}\n\n'
-                 f'⏳ <i>Подожди 3–5 минут.</i>')
-        _STATE[user_id] = {**state, 'step': 'generating'}
-        _send_to_gas(chat_id, user_id, username, idea, post_type)
+        _STATE.pop(user_id, None)
 
     # ── New idea ───────────────────────────────────────────────
     elif data.startswith('newidea:'):
         _STATE.pop(user_id, None)
-        edit_msg(chat_id, msg_id,
-                 cq['message'].get('text', '') + '\n\n✏️ <i>Начинаем заново.</i>')
+        orig = cq['message'].get('text', '')
+        edit_msg(chat_id, msg_id, orig + '\n\n✏️ <i>Начинаем заново.</i>')
         send(chat_id, '✏️ Напиши новую идею для поста:')
 
 
-def _send_to_gas(chat_id, user_id, username, idea, post_type):
+# ── GAS communication ─────────────────────────────────────────
+
+def _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, image_source):
+    """Step ① only — generate content text, then wait for user confirmation."""
     if not GAS_WEBAPP_URL:
-        send(chat_id, '❌ GAS_WEBAPP_URL не настроен. Обратись к администратору.')
+        send(chat_id, '❌ GAS_WEBAPP_URL не настроен.')
         return
     try:
         resp = requests.post(GAS_WEBAPP_URL, json={
-            'action':   'generate',
-            'idea':     idea,
+            'action':      'generate_content',
+            'idea':        idea,
+            'postType':    post_type,
+            'tone':        tone,
+            'imageSource': image_source,
+            'chatId':      chat_id,
+            'userId':      user_id,
+            'username':    username,
+            'secret':      GAS_SECRET,
+        }, timeout=30)
+        data = resp.json()
+        if data.get('status') != 'queued':
+            raise Exception(data.get('error') or resp.text[:200])
+    except Exception as e:
+        log.exception('GAS content request failed')
+        send(chat_id, f'❌ Ошибка запуска генерации:\n<code>{e}</code>')
+        _STATE.get(user_id, {}).update(step='idle')
+
+
+def _send_to_gas_media(chat_id, user_id, username, row_id, post_type):
+    """Steps ②③④ — generate images, overlays, reel."""
+    if not GAS_WEBAPP_URL:
+        send(chat_id, '❌ GAS_WEBAPP_URL не настроен.')
+        return
+    try:
+        resp = requests.post(GAS_WEBAPP_URL, json={
+            'action':   'generate_media',
+            'rowId':    row_id,
             'postType': post_type,
             'chatId':   chat_id,
             'userId':   user_id,
@@ -289,123 +456,83 @@ def _send_to_gas(chat_id, user_id, username, idea, post_type):
         if data.get('status') != 'queued':
             raise Exception(data.get('error') or resp.text[:200])
     except Exception as e:
-        log.exception('GAS request failed')
-        send(chat_id, f'❌ Не удалось запустить генерацию:\n<code>{e}</code>')
-        _STATE[user_id]['step'] = 'idle'
+        log.exception('GAS media request failed')
+        send(chat_id, f'❌ Ошибка запуска генерации изображений:\n<code>{e}</code>')
+        _STATE.get(user_id, {}).update(step='idle')
 
 
-# ── GAS callback endpoint ─────────────────────────────────────
-# GAS calls POST /gas_callback when content is ready.
+# ── GAS callback ──────────────────────────────────────────────
+
+def _send_content_preview(chat_id, body, row_id):
+    """Format and send content preview with confirm/regen/new buttons."""
+    hook      = body.get('hook', '')
+    slides    = body.get('slides', [])
+    caption   = body.get('caption', '')
+    post_type = body.get('postType', '')
+    type_lbl  = POST_TYPE_MAP.get(post_type, post_type)
+
+    slides_fmt = ''
+    for i, s in enumerate(slides):
+        if '|' in s:
+            head, sub = s.split('|', 1)
+            slides_fmt += f'\n<b>{i+1}. {head.strip()}</b>\n<i>{sub.strip()}</i>'
+        else:
+            slides_fmt += f'\n{i+1}. {s}'
+
+    msg = (
+        f'✅ <b>Контент готов!</b> ({type_lbl})\n\n'
+        f'🎣 <b>Hook:</b>\n{hook}\n\n'
+        f'📋 <b>Слайды:</b>{slides_fmt}\n\n'
+        f'📝 <b>Подпись (первые 300 символов):</b>\n{caption[:300]}…'
+    )
+    send(chat_id, msg, reply_markup=_confirm_kb(row_id))
+
 
 @app.route('/gas_callback', methods=['POST'])
 def gas_callback():
-    """
-    Receives progress updates and final content from GAS.
-
-    Expected JSON shapes:
-
-    Content ready (step ①):
-    {
-      "event":     "content_ready",
-      "secret":    "...",
-      "chatId":    123,
-      "rowId":     "5",
-      "postType":  "reel",
-      "hook":      "...",
-      "slides":    ["slide1", "slide2", ...],
-      "caption":   "...",
-      "hashtags":  "..."
-    }
-
-    Images ready (step ②③ — carousel/image):
-    {
-      "event":      "images_ready",
-      "secret":     "...",
-      "chatId":     123,
-      "rowId":      "5",
-      "thumbUrls":  ["https://lh3...", ...]
-    }
-
-    Reel ready (step ④ — after Render finishes):
-    {
-      "event":    "reel_ready",
-      "secret":   "...",
-      "chatId":   123,
-      "rowId":    "5",
-      "videoUrl": "https://drive.google.com/..."   ← or base64
-    }
-
-    Error:
-    {
-      "event":   "error",
-      "secret":  "...",
-      "chatId":  123,
-      "message": "..."
-    }
-    """
     body = request.get_json(force=True, silent=True) or {}
 
     if GAS_SECRET and body.get('secret') != GAS_SECRET:
         return jsonify(ok=False, error='forbidden'), 403
 
-    event    = body.get('event', '')
-    chat_id  = body.get('chatId')
-    row_id   = str(body.get('rowId', ''))
+    event     = body.get('event', '')
+    chat_id   = body.get('chatId')
+    row_id    = str(body.get('rowId', ''))
     post_type = body.get('postType', '')
+    user_id   = body.get('userId')
 
     if not chat_id:
         return jsonify(ok=False, error='missing chatId'), 400
 
     log.info('gas_callback event=%s chatId=%s rowId=%s', event, chat_id, row_id)
 
-    # ── Content text ready ─────────────────────────────────────
     if event == 'content_ready':
-        hook     = body.get('hook', '')
-        slides   = body.get('slides', [])
-        caption  = body.get('caption', '')
-        hashtags = body.get('hashtags', '')
+        # Save for /last command
+        if user_id:
+            _LAST[user_id] = body
 
-        # Format slides nicely
-        slides_fmt = ''
-        for i, s in enumerate(slides):
-            # Replace | separator with bold headline + normal sub-line
-            if '|' in s:
-                head, sub = s.split('|', 1)
-                slides_fmt += f'\n<b>{i+1}. {head.strip()}</b>\n<i>{sub.strip()}</i>'
-            else:
-                slides_fmt += f'\n{i+1}. {s}'
+        # Update state with row_id
+        if user_id and user_id in _STATE:
+            _STATE[user_id]['row_id']  = row_id
+            _STATE[user_id]['step']    = 'awaiting_confirm'
 
-        type_label = POST_TYPE_MAP.get(post_type, post_type)
-        msg = (
-            f'✅ <b>Контент готов!</b> ({type_label})\n\n'
-            f'🎣 <b>Hook:</b>\n{hook}\n\n'
-            f'📋 <b>Слайды:</b>{slides_fmt}\n\n'
-            f'📝 <b>Подпись (первые 200 символов):</b>\n{caption[:200]}…\n\n'
-            f'<i>Изображения и видео скоро придут отдельным сообщением.</i>'
-        )
-        send(chat_id, msg)
+        _send_content_preview(chat_id, body, row_id)
 
-    # ── Slide images ready ─────────────────────────────────────
     elif event == 'images_ready':
         thumb_urls = body.get('thumbUrls', [])
-        if thumb_urls:
-            if len(thumb_urls) == 1:
-                send_photo(chat_id, thumb_urls[0],
-                           caption='🖼️ Готовые слайды:',
-                           reply_markup=_review_kb(row_id))
-            else:
-                send_media_group(chat_id, thumb_urls,
-                                 caption='🖼️ Готовые слайды:')
-                # Send review buttons in a separate message
-                send(chat_id, '👆 Проверь слайды:', reply_markup=_review_kb(row_id))
+        if len(thumb_urls) == 1:
+            send_photo(chat_id, thumb_urls[0],
+                       caption='🖼️ Готовые слайды:',
+                       reply_markup=_review_kb(row_id))
+        elif len(thumb_urls) > 1:
+            send_media_group(chat_id, thumb_urls, caption='🖼️ Готовые слайды:')
+            send(chat_id, '👆 Проверь слайды:', reply_markup=_review_kb(row_id))
         else:
-            send(chat_id, '✅ Слайды готовы (URL не получены).', reply_markup=_review_kb(row_id))
+            send(chat_id, '✅ Слайды готовы.', reply_markup=_review_kb(row_id))
 
-    # ── Reel MP4 ready ─────────────────────────────────────────
     elif event == 'reel_ready':
-        video_url = body.get('videoUrl', '')
         video_b64 = body.get('videoB64', '')
-
+        video_url = body.get('videoUrl', '')
         if video_b64:
             import base64
             video_bytes = base64.b64decode(video_b64)
@@ -417,13 +544,12 @@ def gas_callback():
                  f'🎬 <b>Рилс готов!</b>\n<a href="{video_url}">Скачать MP4</a>',
                  reply_markup=_review_kb(row_id))
         else:
-            send(chat_id, '🎬 Рилс готов! Проверь папку на Google Drive.',
+            send(chat_id, '🎬 Рилс готов! Проверь папку Google Drive.',
                  reply_markup=_review_kb(row_id))
 
-    # ── Error ──────────────────────────────────────────────────
     elif event == 'error':
         msg = body.get('message', 'Неизвестная ошибка')
-        send(chat_id, f'❌ <b>Ошибка генерации:</b>\n<code>{msg}</code>')
+        send(chat_id, f'❌ <b>Ошибка:</b>\n<code>{msg}</code>')
 
     return jsonify(ok=True)
 
@@ -437,11 +563,10 @@ def health():
 
 @app.route('/set_webhook')
 def set_webhook():
-    """Call once to register the webhook: GET /set_webhook?url=https://your-bot.onrender.com"""
-    base_url = request.args.get('url', '').rstrip('/')
-    if not base_url:
-        return 'Pass ?url=https://your-bot-domain.onrender.com', 400
-    payload = {'url': f'{base_url}/webhook'}
+    base = request.args.get('url', '').rstrip('/')
+    if not base:
+        return 'Pass ?url=https://your-domain.onrender.com', 400
+    payload = {'url': f'{base}/webhook'}
     if WEBHOOK_SECRET:
         payload['secret_token'] = WEBHOOK_SECRET
     r = requests.post(f'{TELEGRAM_API}/setWebhook', json=payload, timeout=10)
@@ -455,5 +580,5 @@ def webhook_info():
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8081))
+    port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
