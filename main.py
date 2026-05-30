@@ -442,22 +442,35 @@ def _expand_topics(idea):
         "Темы разные по углу: вопрос, провокация, история, факт, практика. "
         "Верни ТОЛЬКО JSON-массив из 5 строк — без пояснений, без markdown."
     )
-    resp = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        json={
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": f"Идея: {idea}"},
-            ],
-            "max_tokens": 600,
-            "temperature": 0.9,
-            "stream": False,
-        },
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        timeout=30,
-    )
-    resp.raise_for_status()
+    import time as _time
+    last_err = None
+    for attempt in range(3):
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": f"Идея: {idea}"},
+                ],
+                "max_tokens": 600,
+                "temperature": 0.9,
+                "stream": False,
+            },
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            wait = 15 * (attempt + 1)
+            _log(f"Groq 429 — waiting {wait}s (attempt {attempt+1}/3)")
+            _time.sleep(wait)
+            last_err = f"Groq rate limit (429) after 3 attempts"
+            continue
+        resp.raise_for_status()
+        last_err = None
+        break
+    if last_err:
+        raise RuntimeError(last_err)
     raw = resp.json()["choices"][0]["message"]["content"].strip()
 
     # Strip markdown fences if present
