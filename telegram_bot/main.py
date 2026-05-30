@@ -588,7 +588,9 @@ def _handle_callback(cq):
     # ── Regen → show sub-menu ──────────────────────────────────
     elif data.startswith('regen:'):
         row_id = data.split(':', 1)[1]
-        _STATE[user_id] = {**state, 'row_id': row_id}
+        # Ensure post_type stays 'reel' — don't let it default to 'carousel'
+        pt = state.get('post_type') or 'reel'
+        _STATE[user_id] = {**state, 'row_id': row_id, 'post_type': pt}
         edit_msg(chat_id, msg_id,
                  cq['message'].get('text', '') + '\n\n<b>Что регенерировать?</b>',
                  reply_markup=_regen_menu_kb(row_id))
@@ -871,6 +873,18 @@ def gas_callback():
             send(chat_id, '✅ Слайды готовы.', reply_markup=_review_kb(row_id))
 
     elif event == 'reel_ready':
+        # Save post_type + reel_mode in state so regen works after delivery
+        if user_id:
+            st = _STATE.get(user_id, {})
+            _STATE[user_id] = {
+                **st,
+                'step'      : 'awaiting_confirm',
+                'row_id'    : row_id,
+                'post_type' : st.get('post_type', 'reel'),   # keep 'reel'
+                'reel_mode' : st.get('reel_mode', ''),
+                'chat_id'   : chat_id,
+            }
+
         video_b64 = body.get('videoB64', '')
         video_url = body.get('videoUrl', '')
         if video_b64:
