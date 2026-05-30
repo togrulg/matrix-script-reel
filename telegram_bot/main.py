@@ -219,6 +219,14 @@ def _template_kb():
     return {'inline_keyboard': rows}
 
 
+def _reel_mode_kb():
+    return {'inline_keyboard': [
+        [{'text': '🎬 Видео B-roll',   'callback_data': 'reelmode:video'},
+         {'text': '🖼️ Слайды (фото)', 'callback_data': 'reelmode:images'}],
+    ]}
+
+REEL_MODE_MAP = {'video': '🎬 Видео B-roll', 'images': '🖼️ Слайды (фото)'}
+
 def _music_kb():
     rows = []
     for i in range(0, len(MUSIC_VIBES), 2):
@@ -360,8 +368,8 @@ def _handle_message(msg):
 
     # ── Block new idea if generation is already in progress ───
     _BUSY_STEPS = {'generating_content', 'generating_media', 'awaiting_confirm',
-                   'topics_shown', 'type_shown', 'tone_shown', 'source_shown',
-                   'template_shown', 'music_shown'}
+                   'topics_shown', 'type_shown', 'reelmode_shown', 'tone_shown',
+                   'source_shown', 'template_shown', 'music_shown'}
     current_step = _STATE.get(user_id, {}).get('step', 'idle')
     if current_step in _BUSY_STEPS:
         idea_in_progress = _STATE[user_id].get('idea', '…')
@@ -440,9 +448,30 @@ def _handle_callback(cq):
         if not idea:
             send(chat_id, '❌ Потеряна идея. Начни заново.')
             return
-        _STATE[user_id] = {**state, 'step': 'tone_shown', 'post_type': post_type}
+        if post_type == 'reel':
+            # Extra step for reels: choose video B-roll or still images
+            _STATE[user_id] = {**state, 'step': 'reelmode_shown', 'post_type': post_type}
+            edit_msg(chat_id, msg_id,
+                     f'✅ <b>Тема:</b> {idea}\n<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n\n'
+                     f'<b>Режим рилса:</b>',
+                     reply_markup=_reel_mode_kb())
+        else:
+            _STATE[user_id] = {**state, 'step': 'tone_shown', 'post_type': post_type}
+            edit_msg(chat_id, msg_id,
+                     f'✅ <b>Тема:</b> {idea}\n<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n\n'
+                     f'<b>Тон и стиль:</b>',
+                     reply_markup=_tone_kb())
+
+    # ── Reel mode selected ─────────────────────────────────────
+    elif data.startswith('reelmode:'):
+        reel_mode = data.split(':', 1)[1]
+        idea      = state.get('idea', '')
+        post_type = state.get('post_type', 'reel')
+        _STATE[user_id] = {**state, 'step': 'tone_shown', 'reel_mode': reel_mode}
         edit_msg(chat_id, msg_id,
-                 f'✅ <b>Тема:</b> {idea}\n<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n\n'
+                 f'✅ <b>Тема:</b> {idea}\n'
+                 f'<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n'
+                 f'<b>Режим:</b> {REEL_MODE_MAP.get(reel_mode, reel_mode)}\n\n'
                  f'<b>Тон и стиль:</b>',
                  reply_markup=_tone_kb())
 
@@ -498,7 +527,7 @@ def _handle_callback(cq):
                      f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n'
                      f'<b>Шаблон:</b> {template}\n\n'
                      f'⏳ <i>Генерирую контент…</i>')
-            _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template)
+            _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, reel_mode=state.get('reel_mode', ''))
 
     # ── Music vibe selected (reels only) ──────────────────────
     elif data.startswith('music:'):
@@ -518,7 +547,7 @@ def _handle_callback(cq):
                  f'<b>Шаблон:</b> {template}\n'
                  f'<b>Музыка:</b> {MUSIC_VIBE_MAP.get(music_vibe, music_vibe)}\n\n'
                  f'⏳ <i>Генерирую контент…</i>')
-        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe, reel_mode=state.get('reel_mode', ''))
 
     # ── Confirm → generate images ──────────────────────────────
     elif data.startswith('confirm:'):
@@ -545,7 +574,7 @@ def _handle_callback(cq):
         _STATE[user_id] = {**state, 'step': 'generating_content'}
         edit_msg(chat_id, msg_id,
                  f'🔄 <b>Регенерирую контент…</b>\n<b>Тема:</b> {idea}\n\n<i>Подожди немного.</i>')
-        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe, reel_mode=state.get('reel_mode', ''))
 
     # ── Regen → show sub-menu ──────────────────────────────────
     elif data.startswith('regen:'):
@@ -582,7 +611,7 @@ def _handle_callback(cq):
         _STATE[user_id] = {**state, 'step': 'generating_content'}
         edit_msg(chat_id, msg_id,
                  f'🔄 <b>Регенерирую контент…</b>\n<b>Тема:</b> {idea}\n\n<i>Подожди немного.</i>')
-        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe, reel_mode=state.get('reel_mode', ''))
 
     # New template picker
     elif data.startswith('regen_tmpl_pick:'):
@@ -649,7 +678,7 @@ def _handle_callback(cq):
         _STATE[user_id] = {**state, 'step': 'generating_content'}
         edit_msg(chat_id, msg_id,
                  f'🔄 <b>Полная регенерация…</b>\n<b>Тема:</b> {idea}\n\n<i>Подожди 3–5 минут.</i>')
-        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe, reel_mode=state.get('reel_mode', ''))
 
     # Cancel regen menu — restore review buttons
     elif data.startswith('regen_cancel:'):
@@ -677,7 +706,7 @@ def _handle_callback(cq):
 # ── GAS communication ─────────────────────────────────────────
 
 def _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone,
-                         image_source, template='Gold Classic', music_vibe=''):
+                         image_source, template='Gold Classic', music_vibe='', reel_mode=''):
     """Step ① only — generate content text, then wait for user confirmation."""
     if not GAS_WEBAPP_URL:
         send(chat_id, '❌ GAS_WEBAPP_URL не настроен.')
@@ -691,6 +720,7 @@ def _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone,
             'imageSource': image_source,
             'template':    template,
             'musicVibe':   music_vibe,
+            'reelMode':    reel_mode,
             'chatId':      chat_id,
             'userId':      user_id,
             'username':    username,
