@@ -69,17 +69,37 @@ IMAGE_SOURCES = [
 ]
 IMAGE_SOURCE_MAP = {code: label for code, label in IMAGE_SOURCES}
 
-TEMPLATES = [
-    ('Gold Classic',    'Gold Classic ✨'),
-    ('Dark Mystery',    'Dark Mystery 🌑'),
-    ('Celestial Blue',  'Celestial Blue 💙'),
-    ('Rose Gold',       'Rose Gold 🌸'),
-    ('Crimson Power',   'Crimson Power 🔴'),
-    ('Snow White',      'Snow White ⬜'),
-    ('Slate Pro',       'Slate Pro 🩶'),
-    ('Emerald Elite',   'Emerald Elite 💚'),
+_DEFAULT_TEMPLATES = [
+    'Gold Classic', 'Dark Mystery', 'Celestial Blue', 'Rose Gold',
+    'Crimson Power', 'Snow White', 'Slate Pro', 'Emerald Elite',
 ]
-TEMPLATE_MAP = {code: label for code, label in TEMPLATES}
+_TEMPLATE_CACHE: list = []   # refreshed from GAS on first use
+_TEMPLATE_CACHE_AT: float = 0
+
+def _get_templates() -> list:
+    """Return template names, refreshing from GAS at most once per hour."""
+    import time
+    global _TEMPLATE_CACHE, _TEMPLATE_CACHE_AT
+    if _TEMPLATE_CACHE and (time.time() - _TEMPLATE_CACHE_AT) < 3600:
+        return _TEMPLATE_CACHE
+    if GAS_WEBAPP_URL:
+        try:
+            r = requests.get(GAS_WEBAPP_URL,
+                             params={'action': 'templates', 'secret': GAS_SECRET},
+                             timeout=10)
+            names = r.json().get('templates', [])
+            if names:
+                _TEMPLATE_CACHE    = names
+                _TEMPLATE_CACHE_AT = time.time()
+                log.info('Templates refreshed: %s', names)
+                return _TEMPLATE_CACHE
+        except Exception as e:
+            log.warning('Could not fetch templates: %s', e)
+    _TEMPLATE_CACHE    = _DEFAULT_TEMPLATES
+    _TEMPLATE_CACHE_AT = __import__('time').time()
+    return _TEMPLATE_CACHE
+
+TEMPLATE_MAP = {}  # populated dynamically
 
 MUSIC_VIBES = [
     ('ambient meditation spiritual',      'Медитация 🔮'),
@@ -189,11 +209,12 @@ def _source_kb():
 
 
 def _template_kb():
+    templates = _get_templates()
     rows = []
-    for i in range(0, len(TEMPLATES), 2):
+    for i in range(0, len(templates), 2):
         row = []
-        for code, lbl in TEMPLATES[i:i+2]:
-            row.append({'text': lbl, 'callback_data': f'tmpl:{code}'})
+        for name in templates[i:i+2]:
+            row.append({'text': name, 'callback_data': f'tmpl:{name}'})
         rows.append(row)
     return {'inline_keyboard': rows}
 
@@ -431,7 +452,7 @@ def _handle_callback(cq):
                      f'<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n'
                      f'<b>Тон:</b> {TONE_MAP.get(tone, tone)}\n'
                      f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n'
-                     f'<b>Шаблон:</b> {TEMPLATE_MAP.get(template, template)}\n\n'
+                     f'<b>Шаблон:</b> {template}\n\n'
                      f'<b>Фоновая музыка:</b>',
                      reply_markup=_music_kb())
         else:
@@ -440,7 +461,7 @@ def _handle_callback(cq):
                      f'<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n'
                      f'<b>Тон:</b> {TONE_MAP.get(tone, tone)}\n'
                      f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n'
-                     f'<b>Шаблон:</b> {TEMPLATE_MAP.get(template, template)}\n\n'
+                     f'<b>Шаблон:</b> {template}\n\n'
                      f'⏳ <i>Генерирую контент…</i>')
             _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template)
 
@@ -459,7 +480,7 @@ def _handle_callback(cq):
                  f'<b>Тип:</b> {POST_TYPE_MAP.get(post_type, post_type)}\n'
                  f'<b>Тон:</b> {TONE_MAP.get(tone, tone)}\n'
                  f'<b>Источник:</b> {IMAGE_SOURCE_MAP.get(source, source)}\n'
-                 f'<b>Шаблон:</b> {TEMPLATE_MAP.get(template, template)}\n'
+                 f'<b>Шаблон:</b> {template}\n'
                  f'<b>Музыка:</b> {MUSIC_VIBE_MAP.get(music_vibe, music_vibe)}\n\n'
                  f'⏳ <i>Генерирую контент…</i>')
         _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
