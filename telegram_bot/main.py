@@ -238,6 +238,41 @@ def _confirm_kb(row_id):
     ]]}
 
 
+def _regen_menu_kb(row_id):
+    """Sub-menu shown when user taps Regenerate."""
+    return {'inline_keyboard': [
+        [{'text': '🖼️ Только изображения',     'callback_data': f'regen_images:{row_id}'},
+         {'text': '📝 Только контент',          'callback_data': f'regen_content:{row_id}'}],
+        [{'text': '🎨 Новый шаблон',            'callback_data': f'regen_tmpl_pick:{row_id}'},
+         {'text': '🎵 Новая музыка',            'callback_data': f'regen_music_pick:{row_id}'}],
+        [{'text': '🔄 Всё заново',              'callback_data': f'regen_all:{row_id}'}],
+        [{'text': '« Назад',                    'callback_data': f'regen_cancel:{row_id}'}],
+    ]}
+
+
+def _regen_tmpl_kb(row_id):
+    """Template picker for regen — appends row_id as suffix."""
+    templates = _get_templates()
+    rows = []
+    for i in range(0, len(templates), 2):
+        row = []
+        for name in templates[i:i+2]:
+            row.append({'text': name, 'callback_data': f'regen_set_tmpl:{row_id}:{name}'})
+        rows.append(row)
+    return {'inline_keyboard': rows}
+
+
+def _regen_music_kb(row_id):
+    """Music picker for regen."""
+    rows = []
+    for i in range(0, len(MUSIC_VIBES), 2):
+        row = []
+        for code, lbl in MUSIC_VIBES[i:i+2]:
+            row.append({'text': lbl, 'callback_data': f'regen_set_music:{row_id}:{code}'})
+        rows.append(row)
+    return {'inline_keyboard': rows}
+
+
 def _review_kb(row_id):
     return {'inline_keyboard': [[
         {'text': '✅ Одобрить',       'callback_data': f'approve:{row_id}'},
@@ -512,8 +547,29 @@ def _handle_callback(cq):
                  f'🔄 <b>Регенерирую контент…</b>\n<b>Тема:</b> {idea}\n\n<i>Подожди немного.</i>')
         _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
 
-    # ── Regen (full) ───────────────────────────────────────────
+    # ── Regen → show sub-menu ──────────────────────────────────
     elif data.startswith('regen:'):
+        row_id = data.split(':', 1)[1]
+        _STATE[user_id] = {**state, 'row_id': row_id}
+        edit_msg(chat_id, msg_id,
+                 cq['message'].get('text', '') + '\n\n<b>Что регенерировать?</b>',
+                 reply_markup=_regen_menu_kb(row_id))
+
+    # ── Regen sub-options ──────────────────────────────────────
+
+    # Images only — re-run steps ②③ keeping existing content
+    elif data.startswith('regen_images:'):
+        row_id    = data.split(':', 1)[1]
+        post_type = state.get('post_type', 'carousel')
+        _STATE[user_id] = {**state, 'step': 'generating_media'}
+        edit_msg(chat_id, msg_id,
+                 cq['message'].get('text', '').split('\n\nЧто регенерировать?')[0] +
+                 '\n\n⏳ <i>Регенерирую изображения…</i>')
+        _send_to_gas_media(chat_id, user_id, username, row_id, post_type)
+
+    # Content only — re-run step ①
+    elif data.startswith('regen_content:'):
+        row_id     = data.split(':', 1)[1] if ':' in data else ''
         idea       = state.get('idea', '')
         post_type  = state.get('post_type', 'carousel')
         tone       = state.get('tone', 'mystical, premium, clear, emotionally engaging')
@@ -525,8 +581,82 @@ def _handle_callback(cq):
             return
         _STATE[user_id] = {**state, 'step': 'generating_content'}
         edit_msg(chat_id, msg_id,
-                 f'🔄 <b>Регенерирую с нуля…</b>\n<b>Тема:</b> {idea}\n\n<i>Подожди 3–5 минут.</i>')
+                 f'🔄 <b>Регенерирую контент…</b>\n<b>Тема:</b> {idea}\n\n<i>Подожди немного.</i>')
         _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
+
+    # New template picker
+    elif data.startswith('regen_tmpl_pick:'):
+        row_id = data.split(':', 1)[1]
+        _STATE[user_id] = {**state, 'row_id': row_id}
+        edit_msg(chat_id, msg_id,
+                 cq['message'].get('text', '').split('\n\nЧто регенерировать?')[0] +
+                 '\n\n<b>Выбери новый шаблон:</b>',
+                 reply_markup=_regen_tmpl_kb(row_id))
+
+    # Template selected → re-run overlay only
+    elif data.startswith('regen_set_tmpl:'):
+        parts     = data.split(':', 2)
+        row_id    = parts[1] if len(parts) > 1 else ''
+        new_tmpl  = parts[2] if len(parts) > 2 else 'Gold Classic'
+        post_type = state.get('post_type', 'carousel')
+        _STATE[user_id] = {**state, 'step': 'generating_media', 'template': new_tmpl}
+        edit_msg(chat_id, msg_id,
+                 f'🎨 <b>Новый шаблон:</b> {new_tmpl}\n\n⏳ <i>Применяю и регенерирую слайды…</i>')
+        _send_to_gas(chat_id, user_id, username, {
+            'action':    'regen_overlay',
+            'rowId':     row_id,
+            'template':  new_tmpl,
+            'postType':  post_type,
+        })
+
+    # New music picker
+    elif data.startswith('regen_music_pick:'):
+        row_id = data.split(':', 1)[1]
+        _STATE[user_id] = {**state, 'row_id': row_id}
+        edit_msg(chat_id, msg_id,
+                 cq['message'].get('text', '').split('\n\nЧто регенерировать?')[0] +
+                 '\n\n<b>Выбери новую музыку:</b>',
+                 reply_markup=_regen_music_kb(row_id))
+
+    # Music selected → re-submit reel to Render with new music
+    elif data.startswith('regen_set_music:'):
+        parts      = data.split(':', 2)
+        row_id     = parts[1] if len(parts) > 1 else ''
+        music_vibe = parts[2] if len(parts) > 2 else ''
+        post_type  = state.get('post_type', 'reel')
+        _STATE[user_id] = {**state, 'step': 'generating_media', 'music_vibe': music_vibe}
+        lbl = MUSIC_VIBE_MAP.get(music_vibe, music_vibe)
+        edit_msg(chat_id, msg_id,
+                 f'🎵 <b>Новая музыка:</b> {lbl}\n\n⏳ <i>Пересобираю рилс…</i>')
+        _send_to_gas(chat_id, user_id, username, {
+            'action':    'regen_music',
+            'rowId':     row_id,
+            'musicVibe': music_vibe,
+            'postType':  post_type,
+        })
+
+    # Full regen
+    elif data.startswith('regen_all:'):
+        idea       = state.get('idea', '')
+        post_type  = state.get('post_type', 'carousel')
+        tone       = state.get('tone', 'mystical, premium, clear, emotionally engaging')
+        source     = state.get('image_source', 'Pexels')
+        template   = state.get('template', 'Gold Classic')
+        music_vibe = state.get('music_vibe', '')
+        if not idea:
+            send(chat_id, '❌ Потеряна идея. Начни заново.')
+            return
+        _STATE[user_id] = {**state, 'step': 'generating_content'}
+        edit_msg(chat_id, msg_id,
+                 f'🔄 <b>Полная регенерация…</b>\n<b>Тема:</b> {idea}\n\n<i>Подожди 3–5 минут.</i>')
+        _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone, source, template, music_vibe)
+
+    # Cancel regen menu — restore review buttons
+    elif data.startswith('regen_cancel:'):
+        row_id = data.split(':', 1)[1]
+        edit_msg(chat_id, msg_id,
+                 cq['message'].get('text', '').split('\n\nЧто регенерировать?')[0],
+                 reply_markup=_review_kb(row_id))
 
     # ── Approve ────────────────────────────────────────────────
     elif data.startswith('approve:'):
@@ -597,6 +727,22 @@ def _send_to_gas_media(chat_id, user_id, username, row_id, post_type):
         log.exception('GAS media request failed')
         send(chat_id, f'❌ Ошибка запуска генерации изображений:\n<code>{e}</code>')
         _STATE.get(user_id, {}).update(step='idle')
+
+
+def _send_to_gas(chat_id, user_id, username, payload: dict):
+    """Generic GAS POST — for regen_overlay, regen_music, etc."""
+    if not GAS_WEBAPP_URL:
+        send(chat_id, '❌ GAS_WEBAPP_URL не настроен.')
+        return
+    payload.update({'chatId': chat_id, 'userId': user_id, 'username': username, 'secret': GAS_SECRET})
+    try:
+        resp = requests.post(GAS_WEBAPP_URL, json=payload, timeout=30)
+        data = resp.json()
+        if data.get('status') != 'queued':
+            raise Exception(data.get('error') or resp.text[:200])
+    except Exception as e:
+        log.exception('GAS request failed [%s]', payload.get('action'))
+        send(chat_id, f'❌ Ошибка:\n<code>{e}</code>')
 
 
 # ── GAS callback ──────────────────────────────────────────────
