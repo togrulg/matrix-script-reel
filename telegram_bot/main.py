@@ -28,6 +28,7 @@ BOT_TOKEN      = os.environ.get('BOT_TOKEN', '')
 GAS_WEBAPP_URL = os.environ.get('GAS_WEBAPP_URL', '')
 GAS_SECRET     = os.environ.get('GAS_SECRET', '')
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')
+REDIS_URL      = os.environ.get('REDIS_URL', '')
 TELEGRAM_API   = f'https://api.telegram.org/bot{BOT_TOKEN}'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -35,11 +36,123 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# ── Redis (optional — set REDIS_URL env var to enable persistence) ────────────
+_redis = None
+if REDIS_URL:
+    try:
+        import redis as _redis_lib
+        _redis = _redis_lib.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
+        _redis.ping()
+        log.info('Redis connected: %s', REDIS_URL[:40])
+    except Exception as _re:
+        log.warning('Redis unavailable (%s) — falling back to in-memory state', _re)
+        _redis = None
+
+
+class PersistentDict:
+    """
+    Dict-like object that mirrors every write to Redis (if available).
+    Falls back to pure in-memory if Redis is not configured.
+    Keys are always integers (Telegram user IDs).
+    Values are JSON-serialisable dicts.
+    TTL: 7 days per entry.
+    """
+    _TTL = 7 * 24 * 3600  # 7 days
+
+    def __init__(self, prefix: str):
+        self._d: dict = {}
+        self._prefix = prefix
+
+    # ── dict interface ──────────────────────────────────────────
+    def __setitem__(self, key, value):
+        self._d[key] = value
+        if _redis:
+            try:
+                _redis.setex(f'{self._prefix}:{key}', self._TTL,
+                             json.dumps(value, default=str))
+            except Exception as e:
+                log.warning('Redis write [%s:%s]: %s', self._prefix, key, e)
+
+    def __getitem__(self, key):
+        return self._d[key]
+
+    def __contains__(self, key):
+        return key in self._d
+
+    def __len__(self):
+        return len(self._d)
+
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+
+    def pop(self, key, *args):
+        if _redis:
+            try:
+                _redis.delete(f'{self._prefix}:{key}')
+            except Exception as e:
+                log.warning('Redis delete [%s:%s]: %s', self._prefix, key, e)
+        return self._d.pop(key, *args)
+
+    def update_key(self, key, patch: dict):
+        """Update a subset of fields without replacing the whole entry."""
+        current = self._d.get(key, {})
+        current.update(patch)
+        self[key] = current
+
+    # ── persistence ─────────────────────────────────────────────
+    def load(self):
+        """Load all entries from Redis into memory (called once at startup)."""
+        if not _redis:
+            return
+        try:
+            for rkey in _redis.scan_iter(f'{self._prefix}:*'):
+                try:
+                    uid = int(rkey.split(':', 1)[1])
+                    raw = _redis.get(rkey)
+                    if raw:
+                        self._d[uid] = json.loads(raw)
+                except Exception:
+                    pass
+            log.info('Loaded %d %s entries from Redis', len(self._d), self._prefix)
+        except Exception as e:
+            log.warning('Redis load [%s]: %s', self._prefix, e)
+
+
 # ── State ─────────────────────────────────────────────────────
 # { user_id: { step, topics, idea, post_type, tone, image_source,
 #              chat_id, username, row_id, last_content } }
-_STATE: dict = {}
-_LAST:  dict = {}   # { user_id: last content_ready payload }
+_STATE = PersistentDict('state')
+_LAST  = PersistentDict('last')   # { user_id: last content_ready payload }
+
+
+# ── Bot commands list ─────────────────────────────────────────
+BOT_COMMANDS = [
+    ('start',  'Сбросить и начать заново'),
+    ('cancel', 'Отменить текущую генерацию'),
+    ('reset',  'Алиас для /cancel'),
+    ('last',   'Показать последний сгенерированный контент'),
+    ('status', 'Статус текущей операции'),
+    ('help',   'Список всех команд'),
+]
+
+
+def _register_commands():
+    """Register bot commands with Telegram so / autocomplete works."""
+    if not BOT_TOKEN:
+        return
+    try:
+        r = requests.post(
+            f'{TELEGRAM_API}/setMyCommands',
+            json={'commands': [{'command': c, 'description': d} for c, d in BOT_COMMANDS]},
+            timeout=10,
+        )
+        result = r.json()
+        if result.get('ok'):
+            log.info('Bot commands registered (%d)', len(BOT_COMMANDS))
+        else:
+            log.warning('setMyCommands failed: %s', result)
+    except Exception as e:
+        log.warning('setMyCommands error: %s', e)
 
 # ── Constants ─────────────────────────────────────────────────
 POST_TYPES = [
@@ -1120,7 +1233,7 @@ def gas_callback():
 
 @app.route('/health')
 def health():
-    return jsonify(status='ok', states=len(_STATE))
+    return jsonify(status='ok', states=len(_STATE), redis=bool(_redis))
 
 
 @app.route('/set_webhook')
@@ -1139,6 +1252,22 @@ def set_webhook():
 def webhook_info():
     r = requests.get(f'{TELEGRAM_API}/getWebhookInfo', timeout=10)
     return jsonify(r.json())
+
+
+@app.route('/set_commands')
+def set_commands():
+    """Re-register bot commands (/ autocomplete menu). Call once after deploy."""
+    _register_commands()
+    return jsonify(ok=True, commands=[c for c, _ in BOT_COMMANDS])
+
+
+# ── Startup ───────────────────────────────────────────────────
+def _on_startup():
+    _STATE.load()
+    _LAST.load()
+    _register_commands()
+
+threading.Thread(target=_on_startup, daemon=True).start()
 
 
 if __name__ == '__main__':
