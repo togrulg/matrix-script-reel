@@ -340,8 +340,16 @@ def _handle_message(msg):
         return
 
     if text in ('/cancel', '/reset'):
+        prev_step = _STATE.get(user_id, {}).get('step', '')
         _STATE.pop(user_id, None)
-        send(chat_id, '❌ Отменено. Напиши новую идею когда будешь готов.')
+        if prev_step in ('generating_media', 'generating_content'):
+            send(chat_id,
+                 '❌ <b>Отменено.</b>\n\n'
+                 'Генерация в Google Apps Script может ещё идти 1–2 минуты в фоне. '
+                 'Подожди немного перед новой идеей — иначе получишь ошибку "занят".\n\n'
+                 'Напиши идею когда будешь готов.')
+        else:
+            send(chat_id, '❌ Отменено. Напиши новую идею когда будешь готов.')
         return
 
     if text == '/last':
@@ -727,6 +735,13 @@ def _send_to_gas_content(chat_id, user_id, username, idea, post_type, tone,
             'secret':      GAS_SECRET,
         }, timeout=30)
         data = resp.json()
+        if resp.status_code == 409 or 'busy' in (data.get('error') or '').lower():
+            # GAS still processing a previous request — reset state, ask user to retry
+            _STATE.pop(user_id, None)
+            send(chat_id,
+                 '⏳ <b>GAS ещё занят предыдущей генерацией.</b>\n\n'
+                 'Подожди 30–60 секунд и напиши идею снова.')
+            return
         if data.get('status') != 'queued':
             raise Exception(data.get('error') or resp.text[:200])
     except Exception as e:
