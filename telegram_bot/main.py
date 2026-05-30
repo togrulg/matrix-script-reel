@@ -770,12 +770,16 @@ def _send_content_preview(chat_id, body, row_id):
         f'🎣 <b>Hook:</b>\n{hook}\n\n'
         f'📋 <b>Слайды:</b>{slides_fmt}'
     )
-    send(chat_id, msg1[:4090])
 
-    # Full caption in a separate message so nothing is truncated
-    hashtags = body.get('hashtags', '')
-    caption_msg = f'📝 <b>Подпись:</b>\n{caption}\n\n🏷 <b>Хэштеги:</b>\n{hashtags}'
-    send(chat_id, caption_msg[:4090], reply_markup=_confirm_kb(row_id))
+    is_story = post_type == 'story'
+    if is_story:
+        # Story has no caption/hashtags — content lives on the images
+        send(chat_id, msg1[:4090], reply_markup=_confirm_kb(row_id))
+    else:
+        send(chat_id, msg1[:4090])
+        hashtags = body.get('hashtags', '')
+        caption_msg = f'📝 <b>Подпись:</b>\n{caption}\n\n🏷 <b>Хэштеги:</b>\n{hashtags}'
+        send(chat_id, caption_msg[:4090], reply_markup=_confirm_kb(row_id))
 
 
 @app.route('/gas_callback', methods=['POST'])
