@@ -102,6 +102,7 @@ def _get_templates() -> list:
 TEMPLATE_MAP = {}  # populated dynamically
 
 MUSIC_VIBES = [
+    ('pixabay',                           'Pixabay 🎵'),
     ('ambient meditation spiritual',      'Медитация 🔮'),
     ('ambient spiritual uplifting',       'Подъём ⚡'),
     ('ambient spiritual relaxing',        'Релакс 🌊'),

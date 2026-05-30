@@ -224,7 +224,10 @@ def _render_with_video_clips(job_id, data):
 
         if overlay_raw and os.path.exists(overlay_raw):
             # Scale video to fill target canvas (portrait crop), trim, apply fades,
-            # then overlay the chroma-keyed text PNG on top.
+            # then chroma-key the text overlay and composite on top.
+            # format=rgba ensures alpha channel is available for colorkey.
+            # similarity=0.35 keys a wider shade range (handles JPEG-compression artifacts in PNG).
+            # blend=0.1 softens edges to avoid hard green fringing.
             vf_parts = [
                 f"scale={width}:{height}:force_original_aspect_ratio=increase",
                 f"crop={width}:{height}",
@@ -233,13 +236,16 @@ def _render_with_video_clips(job_id, data):
             ]
             if fade_in  > 0: vf_parts.append(f"fade=t=in:st=0:d={fade_in}")
             if fade_out > 0: vf_parts.append(f"fade=t=out:st={max(0, dur - fade_out):.3f}:d={fade_out}")
-            # Scale overlay to match target canvas
-            ovl_vf = f"scale={width}:{height}," \
-                     f"colorkey=color=00ff00:similarity=0.25:blend=0.05"
+            ovl_vf = (
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},"
+                f"format=rgba,"
+                f"colorkey=color=0x00ff00:similarity=0.35:blend=0.1"
+            )
             filter_complex = (
                 f"[0:v]{','.join(vf_parts)}[bg];"
                 f"[1:v]{ovl_vf}[txt];"
-                f"[bg][txt]overlay=0:0[out]"
+                f"[bg][txt]overlay=0:0:format=auto[out]"
             )
             cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
@@ -247,8 +253,8 @@ def _render_with_video_clips(job_id, data):
                 "-i", overlay_raw,
                 "-filter_complex", filter_complex,
                 "-map", "[out]",
-                "-c:v", "libx264", "-preset", "ultrafast",
-                "-crf", "26", "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", "fast",
+                "-crf", "20", "-pix_fmt", "yuv420p",
                 composited,
             ]
         else:
@@ -265,8 +271,8 @@ def _render_with_video_clips(job_id, data):
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-ss", "0", "-t", str(dur), "-i", clip_raw,
                 "-vf", ",".join(vf_parts),
-                "-c:v", "libx264", "-preset", "ultrafast",
-                "-crf", "26", "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", "fast",
+                "-crf", "20", "-pix_fmt", "yuv420p",
                 composited,
             ]
 
