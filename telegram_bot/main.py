@@ -361,8 +361,15 @@ def send_media_group(chat_id, photo_urls, caption=''):
     return _tg('sendMediaGroup', {'chat_id': chat_id, 'media': json.dumps(media)})
 
 
-def send_video_bytes(chat_id, video_bytes, caption='', reply_markup=None):
-    p = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'}
+def send_video_bytes(chat_id, video_bytes, caption='', reply_markup=None, width=540, height=960):
+    p = {
+        'chat_id'           : chat_id,
+        'caption'           : caption,
+        'parse_mode'        : 'HTML',
+        'width'             : width,
+        'height'            : height,
+        'supports_streaming': True,
+    }
     if reply_markup:
         p['reply_markup'] = json.dumps(reply_markup)
     return _tg('sendVideo', p, files={'video': ('reel.mp4', video_bytes, 'video/mp4')})
@@ -1309,10 +1316,18 @@ def gas_callback():
             except Exception as e:
                 log.warning('Failed to send b64 video: %s', e)
         if not sent and video_url:
-            # Download from public Drive URL and upload to Telegram
+            # Download from public Drive URL and upload to Telegram.
+            # ?confirm=t bypasses Google's virus-scan redirect for larger files.
             try:
-                r = requests.get(video_url, timeout=120, stream=True)
+                dl_url = video_url if 'confirm=' in video_url else (
+                    video_url + ('&' if '?' in video_url else '?') + 'confirm=t'
+                )
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                r = requests.get(dl_url, timeout=120, headers=headers, allow_redirects=True)
                 r.raise_for_status()
+                content_type = r.headers.get('Content-Type', '')
+                if 'text/html' in content_type:
+                    raise ValueError(f'Got HTML instead of video (Drive confirmation page?) — content-type: {content_type}')
                 video_bytes = r.content
                 send_video_bytes(chat_id, video_bytes,
                                  caption='🎬 Рилс готов!',
