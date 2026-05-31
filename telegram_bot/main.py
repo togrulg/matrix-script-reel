@@ -361,7 +361,7 @@ def send_media_group(chat_id, photo_urls, caption=''):
     return _tg('sendMediaGroup', {'chat_id': chat_id, 'media': json.dumps(media)})
 
 
-def send_video_bytes(chat_id, video_bytes, caption='', reply_markup=None, width=1080, height=1920):
+def send_video_bytes(chat_id, video_bytes, caption='', reply_markup=None, width=720, height=1280):
     p = {
         'chat_id'           : chat_id,
         'caption'           : caption,
