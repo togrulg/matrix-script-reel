@@ -1297,17 +1297,30 @@ def gas_callback():
 
         video_b64 = body.get('videoB64', '')
         video_url = body.get('videoUrl', '')
+        sent = False
         if video_b64:
-            import base64
-            video_bytes = base64.b64decode(video_b64)
-            send_video_bytes(chat_id, video_bytes,
-                             caption='🎬 Рилс готов!',
-                             reply_markup=_review_kb(row_id))
-        elif video_url:
-            send(chat_id,
-                 f'🎬 <b>Рилс готов!</b>\n<a href="{video_url}">Скачать MP4</a>',
-                 reply_markup=_review_kb(row_id))
-        else:
+            import base64 as _b64
+            try:
+                video_bytes = _b64.b64decode(video_b64)
+                send_video_bytes(chat_id, video_bytes,
+                                 caption='🎬 Рилс готов!',
+                                 reply_markup=_review_kb(row_id))
+                sent = True
+            except Exception as e:
+                log.warning('Failed to send b64 video: %s', e)
+        if not sent and video_url:
+            # Download from public Drive URL and upload to Telegram
+            try:
+                r = requests.get(video_url, timeout=120, stream=True)
+                r.raise_for_status()
+                video_bytes = r.content
+                send_video_bytes(chat_id, video_bytes,
+                                 caption='🎬 Рилс готов!',
+                                 reply_markup=_review_kb(row_id))
+                sent = True
+            except Exception as e:
+                log.warning('Failed to download/send video from URL: %s', e)
+        if not sent:
             send(chat_id, '🎬 Рилс готов! Проверь папку Google Drive.',
                  reply_markup=_review_kb(row_id))
 
