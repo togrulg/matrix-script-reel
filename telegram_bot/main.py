@@ -217,6 +217,7 @@ BOT_COMMANDS = [
     ('reset',  'Алиас для /cancel'),
     ('last',   'Показать последний сгенерированный контент'),
     ('status', 'Статус текущей операции'),
+    ('clear',  'Очистить папку с картинками и видео'),
     ('help',   'Список всех команд'),
 ]
 
@@ -573,6 +574,7 @@ def _handle_message(msg):
              '• /cancel — отменить текущую генерацию\n'
              '• /last — показать последний сгенерированный контент\n'
              '• /status — статус текущей операции\n'
+             '• /clear — очистить папку с картинками и видео\n'
              '• /start — сбросить и начать заново\n'
              '• /help — эта справка')
         return
@@ -618,6 +620,19 @@ def _handle_message(msg):
             idea = state.get('idea', '—')
             pt   = POST_TYPE_MAP.get(state.get('post_type', ''), '—')
             send(chat_id, f'⚙️ <b>Статус:</b> {step}\n<b>Тема:</b> {idea}\n<b>Тип:</b> {pt}')
+        return
+
+    if text == '/clear':
+        send(chat_id,
+             '🗑 <b>Очистить рабочую папку?</b>\n\n'
+             'Все картинки, оверлеи и видео будут перемещены в корзину Google Drive.\n'
+             'URL-адреса в таблице тоже очистятся, чтобы следующий запуск '
+             'сгенерировал всё заново.\n\n'
+             '<i>Это не удаляет контент из таблицы — только файлы.</i>',
+             reply_markup={'inline_keyboard': [[
+                 {'text': '✅ Да, очистить', 'callback_data': 'clear_folder:confirm'},
+                 {'text': '❌ Отмена',        'callback_data': 'clear_folder:cancel'},
+             ]]})
         return
 
     if text.startswith('/'):
@@ -1077,6 +1092,36 @@ def _handle_callback(cq):
         edit_msg(chat_id, msg_id,
                  cq['message'].get('text', '').split('\n\nЧто регенерировать?')[0],
                  reply_markup=_review_kb(row_id))
+
+    # ── Clear Drive folder ────────────────────────────────────
+    elif data == 'clear_folder:cancel':
+        edit_msg(chat_id, msg_id, '❌ Очистка отменена.')
+
+    elif data == 'clear_folder:confirm':
+        edit_msg(chat_id, msg_id, '⏳ <i>Очищаю папку…</i>')
+        try:
+            resp = requests.post(GAS_WEBAPP_URL, json={
+                'action'  : 'clear_folder',
+                'chatId'  : chat_id,
+                'userId'  : user_id,
+                'username': username,
+                'secret'  : GAS_SECRET,
+            }, timeout=60)
+            data_r = resp.json()
+            if data_r.get('status') == 'ok':
+                n    = data_r.get('deleted', 0)
+                name = data_r.get('folderName', 'рабочая папка')
+                edit_msg(chat_id, msg_id,
+                         f'✅ <b>Папка очищена!</b>\n\n'
+                         f'Удалено файлов: <b>{n}</b>\n'
+                         f'Папка: <i>{name}</i>\n\n'
+                         f'URL-адреса в таблице сброшены — следующий запуск создаст всё заново.')
+            else:
+                edit_msg(chat_id, msg_id,
+                         f'❌ Ошибка: {data_r.get("error", resp.text[:200])}')
+        except Exception as e:
+            log.exception('clear_folder failed')
+            edit_msg(chat_id, msg_id, f'❌ Ошибка связи с GAS:\n<code>{e}</code>')
 
     # ── Approve ────────────────────────────────────────────────
     elif data.startswith('approve:'):
