@@ -959,9 +959,14 @@ def _handle_callback(cq):
         # Ensure post_type stays 'reel' — don't let it default to 'carousel'
         pt = state.get('post_type') or 'reel'
         _STATE[user_id] = {**state, 'row_id': row_id, 'post_type': pt}
-        edit_msg(chat_id, msg_id,
-                 cq['message'].get('text', '') + '\n\n<b>Что регенерировать?</b>',
-                 reply_markup=_regen_menu_kb(row_id))
+        msg_text = cq['message'].get('text', '')
+        if msg_text:
+            edit_msg(chat_id, msg_id,
+                     msg_text + '\n\n<b>Что регенерировать?</b>',
+                     reply_markup=_regen_menu_kb(row_id))
+        else:
+            # Message is a video/photo — can't editMessageText, send a new one
+            send(chat_id, '<b>Что регенерировать?</b>', reply_markup=_regen_menu_kb(row_id))
 
     # ── Regen sub-options ──────────────────────────────────────
 
