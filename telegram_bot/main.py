@@ -361,7 +361,7 @@ def send_media_group(chat_id, photo_urls, caption=''):
     return _tg('sendMediaGroup', {'chat_id': chat_id, 'media': json.dumps(media)})
 
 
-def send_video_bytes(chat_id, video_bytes, caption='', reply_markup=None, width=540, height=960):
+def send_video_bytes(chat_id, video_bytes, caption='', reply_markup=None, width=1080, height=1920):
     p = {
         'chat_id'           : chat_id,
         'caption'           : caption,
@@ -1322,19 +1322,27 @@ def gas_callback():
                 dl_url = video_url if 'confirm=' in video_url else (
                     video_url + ('&' if '?' in video_url else '?') + 'confirm=t'
                 )
+                log.info('Downloading reel from Drive: %s', dl_url[:120])
                 headers = {'User-Agent': 'Mozilla/5.0'}
                 r = requests.get(dl_url, timeout=120, headers=headers, allow_redirects=True)
                 r.raise_for_status()
                 content_type = r.headers.get('Content-Type', '')
+                size_kb = len(r.content) // 1024
+                log.info('Drive download: %s, %d KB', content_type, size_kb)
                 if 'text/html' in content_type:
-                    raise ValueError(f'Got HTML instead of video (Drive confirmation page?) — content-type: {content_type}')
+                    raise ValueError(f'Got HTML instead of video — Drive confirmation page not bypassed. URL: {dl_url[:100]}')
                 video_bytes = r.content
+                log.info('Uploading %d KB to Telegram…', size_kb)
                 send_video_bytes(chat_id, video_bytes,
                                  caption='🎬 Рилс готов!',
                                  reply_markup=_review_kb(row_id))
                 sent = True
+                log.info('Reel delivered to Telegram successfully')
             except Exception as e:
                 log.warning('Failed to download/send video from URL: %s', e)
+                send(chat_id, f'⚠️ Не удалось загрузить видео автоматически. <a href="{video_url}">Скачать из Drive</a>',
+                     reply_markup=_review_kb(row_id))
+                sent = True  # suppress the generic fallback below
         if not sent:
             send(chat_id, '🎬 Рилс готов! Проверь папку Google Drive.',
                  reply_markup=_review_kb(row_id))

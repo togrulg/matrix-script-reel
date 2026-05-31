@@ -361,8 +361,8 @@ def _render_with_still_images(job_id, data):
     # xfade loads ALL clips into memory simultaneously — OOM on 512MB free tier.
     # Force 'fade' which processes clips one at a time then stream-copies.
     transition = "fade"
-    width      = int(data.get("width",  540))   # 540x960 = 9:16, ~40% less memory than 720x1280
-    height     = int(data.get("height", 960))
+    width      = int(data.get("width",  1080))  # 1080x1920 = full-HD 9:16 for Instagram
+    height     = int(data.get("height", 1920))
 
     if not images:
         raise ValueError("No images provided")
@@ -422,7 +422,7 @@ def _render_with_still_images(job_id, data):
 
         cmd = ["ffmpeg", "-y", "-loglevel", "error",
                "-loop", "1", "-t", str(dur), "-i", frame,
-               "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast",
+               "-vf", vf, "-c:v", "libx264", "-preset", "fast",
                "-crf", "26", "-pix_fmt", "yuv420p", clip]
         r = subprocess.run(cmd, stderr=subprocess.PIPE, timeout=180)
         if r.returncode != 0:
