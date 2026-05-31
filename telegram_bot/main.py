@@ -542,7 +542,7 @@ def webhook():
 def _handle_message(msg):
     user_id  = msg['from']['id']
     chat_id  = msg['chat']['id']
-    text     = (msg.get('text') or '').strip()
+    text     = (msg.get('text') or '').strip().split('@')[0]
     username = msg['from'].get('username') or msg['from'].get('first_name', 'User')
 
     if not text:
