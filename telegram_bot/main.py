@@ -305,6 +305,7 @@ MUSIC_VIBES = [
     ('ambient spiritual uplifting',       'Подъём ⚡'),
     ('ambient spiritual relaxing',        'Релакс 🌊'),
     ('ambient spiritual epic',            'Эпик 🎺'),
+    ('drive',                             'Моя музыка 🎧'),
     ('none',                              'Без музыки 🔇'),
 ]
 MUSIC_VIBE_MAP = {code: label for code, label in MUSIC_VIBES}
